@@ -4,12 +4,12 @@ use super::*;
 fn unbounded_loop() {
     // Set handler timeout to 3 seconds.
     env::set_var(crate::host::TIMEOUT_ENV_VAR, "3");
-    let mut module = test_module(
+    let module = test_module(
         "unboundedLoop",
         mock_data_source("wasm_test/non_terminating.wasm"),
     );
-    module.start_time = Instant::now();
-    let func = module.module.get_func("loop").unwrap().get0().unwrap();
+    //module.start_time = Instant::now();
+    let func = module.get_func("loop").get0().unwrap();
     let res: Result<(), _> = func();
     assert_eq!(
         res.unwrap_err().to_string(),
@@ -23,12 +23,7 @@ fn unbounded_recursion() {
         "unboundedRecursion",
         mock_data_source("wasm_test/non_terminating.wasm"),
     );
-    let func = module
-        .module
-        .get_func("rabbit_hole")
-        .unwrap()
-        .get0()
-        .unwrap();
+    let func = module.get_func("rabbit_hole").get0().unwrap();
     let res: Result<(), _> = func();
     assert_eq!(
         res.unwrap_err().to_string(),
@@ -163,12 +158,7 @@ fn abi_ethabi_token_identity() {
     let token_bool = Token::Bool(true);
 
     let token_bool_ptr = module.asc_new(&token_bool);
-    let func = module
-        .module
-        .get_func("token_to_bool")
-        .unwrap()
-        .get1()
-        .unwrap();
+    let func = module.get_func("token_to_bool").get1().unwrap();
     let boolean: i32 = func(token_bool_ptr.wasm_ptr()).unwrap();
 
     let new_token_ptr = module.takes_val_returns_ptr("token_from_bool", boolean);
@@ -212,13 +202,7 @@ fn abi_store_value() {
     );
 
     // Value::Null
-
-    let func = module
-        .module
-        .get_func("value_null")
-        .unwrap()
-        .get0()
-        .unwrap();
+    let func = module.get_func("value_null").get0().unwrap();
     let ptr: i32 = func().unwrap();
     let null_value_ptr: AscPtr<AscEnum<StoreValueKind>> = ptr.into();
     let null_value: Value = module.try_asc_get(null_value_ptr).unwrap();
@@ -258,12 +242,7 @@ fn abi_store_value() {
     assert_eq!(new_value, Value::Bool(boolean));
 
     // Value::List
-    let func = module
-        .module
-        .get_func("array_from_values")
-        .unwrap()
-        .get2()
-        .unwrap();
+    let func = module.get_func("array_from_values").get2().unwrap();
     let new_value_ptr: i32 = func(module.asc_new(string).wasm_ptr(), int).unwrap();
     let new_value_ptr = AscPtr::from(new_value_ptr);
     let new_value: Value = module.try_asc_get(new_value_ptr).unwrap();
@@ -382,12 +361,7 @@ fn invalid_discriminant() {
         mock_data_source("wasm_test/abi_store_value.wasm"),
     );
 
-    let func = module
-        .module
-        .get_func("invalid_discriminant")
-        .unwrap()
-        .get0()
-        .unwrap();
+    let func = module.get_func("invalid_discriminant").get0().unwrap();
     let ptr: i32 = func().unwrap();
     let _value: Value = module.try_asc_get(ptr.into()).unwrap();
 }

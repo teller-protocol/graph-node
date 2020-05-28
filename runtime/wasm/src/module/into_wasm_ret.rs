@@ -43,17 +43,17 @@ impl IntoWasmRet for u64 {
     }
 }
 
-impl<C> IntoWasmRet for AscPtr<C> {
-    type Ret = i32;
-    fn into_wasm_ret(self) -> i32 {
-        self.wasm_ptr()
-    }
-}
-
 impl IntoWasmRet for bool {
     type Ret = i32;
     fn into_wasm_ret(self) -> i32 {
         self as i32
+    }
+}
+
+impl<C> IntoWasmRet for AscPtr<C> {
+    type Ret = i32;
+    fn into_wasm_ret(self) -> i32 {
+        self.wasm_ptr()
     }
 }
 

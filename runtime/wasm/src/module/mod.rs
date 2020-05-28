@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
 use std::convert::TryFrom;
 use std::ops::Deref;
@@ -29,8 +29,147 @@ use into_wasm_ret::IntoWasmRet;
 #[cfg(test)]
 mod test;
 
-pub(crate) struct WasmiModule {
-    pub module: wasmtime::Instance,
+/// Handle to a WASM instance, which is terminated if and only if this is dropped.
+pub(crate) struct WasmInstanceHandle {
+    instance: Rc<RefCell<Option<WasmInstance>>>,
+}
+
+impl WasmInstanceHandle {
+    pub(crate) fn handle_json_callback(
+        mut self,
+        handler_name: &str,
+        value: &serde_json::Value,
+        user_data: &store::Value,
+    ) -> Result<BlockState, anyhow::Error> {
+        let value = self.instance().asc_new(value);
+        let user_data = self.instance().asc_new(user_data);
+
+        // Invoke the callback
+        self.instance()
+            .instance
+            .get_func(handler_name)
+            .with_context(|| format!("function {} not found", handler_name))?
+            .get2()?(value.wasm_ptr(), user_data.wasm_ptr())
+        .with_context(|| format!("Failed to handle callback '{}'", handler_name))?;
+
+        Ok(self.take_instance().ctx.state)
+    }
+
+    pub(crate) fn handle_ethereum_log(
+        mut self,
+        handler_name: &str,
+        transaction: Arc<Transaction>,
+        log: Arc<Log>,
+        params: Vec<LogParam>,
+    ) -> Result<BlockState, anyhow::Error> {
+        let block = self.instance().ctx.block.clone();
+
+        // Prepare an EthereumEvent for the WASM runtime
+        // Decide on the destination type using the mapping
+        // api version provided in the subgraph manifest
+        let event = if self.instance().ctx.host_exports.api_version >= Version::new(0, 0, 2) {
+            self.instance()
+                .asc_new::<AscEthereumEvent<AscEthereumTransaction_0_0_2>, _>(&EthereumEventData {
+                    block: EthereumBlockData::from(block.as_ref()),
+                    transaction: EthereumTransactionData::from(transaction.deref()),
+                    address: log.address,
+                    log_index: log.log_index.unwrap_or(U256::zero()),
+                    transaction_log_index: log.log_index.unwrap_or(U256::zero()),
+                    log_type: log.log_type.clone(),
+                    params,
+                })
+                .erase()
+        } else {
+            self.instance()
+                .asc_new::<AscEthereumEvent<AscEthereumTransaction>, _>(&EthereumEventData {
+                    block: EthereumBlockData::from(block.as_ref()),
+                    transaction: EthereumTransactionData::from(transaction.deref()),
+                    address: log.address,
+                    log_index: log.log_index.unwrap_or(U256::zero()),
+                    transaction_log_index: log.log_index.unwrap_or(U256::zero()),
+                    log_type: log.log_type.clone(),
+                    params,
+                })
+                .erase()
+        };
+
+        // Invoke the event handler
+        self.invoke_handler(handler_name, event)?;
+
+        // Return the output state
+        Ok(self.take_instance().ctx.state)
+    }
+
+    pub(crate) fn handle_ethereum_call(
+        mut self,
+        handler_name: &str,
+        transaction: Arc<Transaction>,
+        call: Arc<EthereumCall>,
+        inputs: Vec<LogParam>,
+        outputs: Vec<LogParam>,
+    ) -> Result<BlockState, anyhow::Error> {
+        let call = EthereumCallData {
+            to: call.to,
+            from: call.from,
+            block: EthereumBlockData::from(self.instance().ctx.block.as_ref()),
+            transaction: EthereumTransactionData::from(transaction.deref()),
+            inputs,
+            outputs,
+        };
+        let arg = if self.instance().ctx.host_exports.api_version >= Version::new(0, 0, 3) {
+            self.instance()
+                .asc_new::<AscEthereumCall_0_0_3, _>(&call)
+                .erase()
+        } else {
+            self.instance().asc_new::<AscEthereumCall, _>(&call).erase()
+        };
+
+        self.invoke_handler(handler_name, arg)?;
+
+        Ok(self.take_instance().ctx.state)
+    }
+
+    pub(crate) fn handle_ethereum_block(
+        mut self,
+        handler_name: &str,
+    ) -> Result<BlockState, anyhow::Error> {
+        let block = EthereumBlockData::from(self.instance().ctx.block.as_ref());
+
+        // Prepare an EthereumBlock for the WASM runtime
+        let arg = self.instance().asc_new(&block);
+
+        self.invoke_handler(handler_name, arg)?;
+
+        Ok(self.take_instance().ctx.state)
+    }
+
+    pub(crate) fn instance(&mut self) -> RefMut<'_, WasmInstance> {
+        RefMut::map(self.instance.borrow_mut(), |i| i.as_mut().unwrap())
+    }
+
+    pub(crate) fn take_instance(&mut self) -> WasmInstance {
+        self.instance.borrow_mut().take().unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn borrow_instance(&self) -> std::cell::Ref<'_, WasmInstance> {
+        std::cell::Ref::map(self.instance.borrow(), |i| i.as_ref().unwrap())
+    }
+
+    fn invoke_handler<C>(&mut self, handler: &str, arg: AscPtr<C>) -> Result<(), anyhow::Error> {
+        let func = self
+            .instance()
+            .instance
+            .get_func(handler)
+            .with_context(|| format!("function {} not found", handler))?;
+
+        func.get1()?(arg.wasm_ptr())
+            .with_context(|| format!("Failed to invoke handler '{}'", handler))
+    }
+}
+
+pub(crate) struct WasmInstance {
+    instance: wasmtime::Instance,
     memory: Memory,
     memory_allocate: Box<dyn Fn(i32) -> Result<i32, Trap>>,
 
@@ -45,30 +184,33 @@ pub(crate) struct WasmiModule {
     arena_free_size: i32,
 }
 
-impl WasmiModule {
+impl WasmInstance {
     pub fn from_valid_module_with_ctx(
         valid_module: Arc<ValidModule>,
         ctx: MappingContext,
         host_metrics: Arc<HostMetrics>,
-    ) -> Result<Self, anyhow::Error> {
+    ) -> Result<WasmInstanceHandle, anyhow::Error> {
         let user_module = &valid_module.user_module;
         let mut linker = wasmtime::Linker::new(valid_module.module.store());
 
-        // Used by exports to access the module context. It is `None` while the module is not yet
+        // Used by exports to access the instance context. It is `None` while the module is not yet
         // instantiated. A desirable consequence is that start function cannot access host exports.
-        let shared_module: Rc<RefCell<Option<WasmiModule>>> = Rc::new(RefCell::new(None));
+        let shared_instance: Rc<RefCell<Option<WasmInstance>>> = Rc::new(RefCell::new(None));
 
         macro_rules! link {
-            ($wasm_name:expr, $rust_name:ident, $($param:ident: $ty:ty),*) => {
-                let func_shared_module = shared_module.clone();
+            ($wasm_name:expr, $rust_name:ident, $($param:ident),*) => {
+                let func_shared_instance = shared_instance.clone();
                 linker.func(
                     user_module,
                     $wasm_name,
-                    move |$($param: $ty),*| {
-                        let mut module = func_shared_module.borrow_mut();
-                        let module = module.as_mut().unwrap();
-                        let _section = module.stopwatch_host_export_other();
-                        module.$rust_name(
+                    move |$($param: i32),*| {
+                        let mut instance = func_shared_instance.borrow_mut();
+                        let instance = instance.as_mut().unwrap();
+                        let _section = instance
+                            .host_metrics
+                            .stopwatch
+                            .start_section("host_export_other");
+                        instance.$rust_name(
                             $($param.into()),*
                         ).into_wasm_ret()
                     }
@@ -76,14 +218,14 @@ impl WasmiModule {
             };
         }
 
-        let func_shared_module = shared_module.clone();
+        let func_shared_instance = shared_instance.clone();
         linker.func(
             "env",
             "abort",
             move |message_ptr: i32, file_name_ptr: i32, line_number: i32, column_number: i32| {
-                let mut module = func_shared_module.borrow_mut();
-                let module = module.as_mut().unwrap();
-                module.abort(
+                let mut instance = func_shared_instance.borrow_mut();
+                let instance = instance.as_mut().unwrap();
+                instance.abort(
                     message_ptr.into(),
                     file_name_ptr.into(),
                     line_number,
@@ -92,109 +234,158 @@ impl WasmiModule {
             },
         )?;
 
-        let func_shared_module = shared_module.clone();
+        let func_shared_instance = shared_instance.clone();
         linker.func(
             user_module,
             "store.set",
             move |entity_ptr: i32, id_ptr: i32, data_ptr: i32| {
-                let mut module = func_shared_module.borrow_mut();
-                let module = module.as_mut().unwrap();
-                let stopwatch = &module.host_metrics.stopwatch;
+                let mut instance = func_shared_instance.borrow_mut();
+                let instance = instance.as_mut().unwrap();
+                let stopwatch = &instance.host_metrics.stopwatch;
                 let _section = stopwatch.start_section("host_export_store_set");
-                module.store_set(entity_ptr.into(), id_ptr.into(), data_ptr.into())
+                instance.store_set(entity_ptr.into(), id_ptr.into(), data_ptr.into())
             },
         )?;
 
-        let func_shared_module = shared_module.clone();
+        let func_shared_instance = shared_instance.clone();
         linker.func(
             user_module,
             "store.get",
             move |entity_ptr: i32, id_ptr: i32| {
                 let start = Instant::now();
-                let mut module = func_shared_module.borrow_mut();
-                let module = module.as_mut().unwrap();
-                let stopwatch = &module.host_metrics.stopwatch;
+                let mut instance = func_shared_instance.borrow_mut();
+                let instance = instance.as_mut().unwrap();
+                let stopwatch = &instance.host_metrics.stopwatch;
                 let _section = stopwatch.start_section("host_export_store_get");
-                let ret = module
+                let ret = instance
                     .store_get(entity_ptr.into(), id_ptr.into())?
                     .wasm_ptr();
-                module
+                instance
                     .host_metrics
                     .observe_host_fn_execution_time(start.elapsed().as_secs_f64(), "store_get");
                 Ok(ret)
             },
         )?;
 
-        let func_shared_module = shared_module.clone();
+        let func_shared_instance = shared_instance.clone();
         linker.func(user_module, "ethereum.call", move |call_ptr: i32| {
             let start = Instant::now();
-            let mut module = func_shared_module.borrow_mut();
-            let module = module.as_mut().unwrap();
-            let stopwatch = &module.host_metrics.stopwatch;
+            let mut instance = func_shared_instance.borrow_mut();
+            let instance = instance.as_mut().unwrap();
+            let stopwatch = &instance.host_metrics.stopwatch;
             let _section = stopwatch.start_section("host_export_ethereum_call");
 
             // For apiVersion >= 0.0.4 the call passed from the mapping includes the
             // function signature; subgraphs using an apiVersion < 0.0.4 don't pass
             // the the signature along with the call.
-            let arg = if module.ctx.host_exports.api_version >= Version::new(0, 0, 4) {
-                module.asc_get::<_, AscUnresolvedContractCall_0_0_4>(call_ptr.into())
+            let arg = if instance.ctx.host_exports.api_version >= Version::new(0, 0, 4) {
+                instance.asc_get::<_, AscUnresolvedContractCall_0_0_4>(call_ptr.into())
             } else {
-                module.asc_get::<_, AscUnresolvedContractCall>(call_ptr.into())
+                instance.asc_get::<_, AscUnresolvedContractCall>(call_ptr.into())
             };
 
-            let ret = module.ethereum_call(arg)?.wasm_ptr();
-            module
+            let ret = instance.ethereum_call(arg)?.wasm_ptr();
+            instance
                 .host_metrics
                 .observe_host_fn_execution_time(start.elapsed().as_secs_f64(), "ethereum_call");
             Ok(ret)
         })?;
 
-        link!("store.remove", store_remove, entity_ptr: i32, id_ptr: i32);
+        let func_shared_instance = shared_instance.clone();
+        linker.func(user_module, "ipfs.cat", move |hash_ptr: i32| {
+            let mut instance = func_shared_instance.borrow_mut();
+            let instance = instance.as_mut().unwrap();
+            let stopwatch = &instance.host_metrics.stopwatch;
+            let _section = stopwatch.start_section("host_export_ipfs_cat");
+            instance.ipfs_cat(hash_ptr.into()).into_wasm_ret()
+        })?;
 
-        link!("typeConversion.bytesToString", bytes_to_string, ptr: i32);
-        link!("typeConversion.bytesToHex", bytes_to_hex, ptr: i32);
-        link!("typeConversion.bigIntToString", big_int_to_string, ptr: i32);
-        link!("typeConversion.bigIntToHex", big_int_to_hex, ptr: i32);
-        link!("typeConversion.stringToH160", string_to_h160, ptr: i32);
-
-        link!("json.fromBytes", json_from_bytes, ptr: i32);
-        link!("json.try_FromBytes", json_try_from_bytes, ptr: i32);
-        link!("json.toI64", json_to_i64, ptr: i32);
-        link!("json.toU64", json_to_u64, ptr: i32);
-        link!("json.toF64", json_to_f64, ptr: i32);
-        link!("json.toBigInt", json_to_big_int, ptr: i32);
-
-        link!("ipfs.cat", ipfs_cat, ptr: i32);
-        link!(
+        let func_shared_instance = shared_instance.clone();
+        linker.func(
+            user_module,
             "ipfs.map",
-            ipfs_map,
-            link_ptr: i32,
-            callback: i32,
-            user_data: i32,
-            flags: i32
+            move |link_ptr: i32, callback: i32, user_data: i32, flags: i32| {
+                let mut instance = func_shared_instance.borrow_mut();
+                let instance = instance.as_mut().unwrap();
+                let stopwatch = &instance.host_metrics.stopwatch;
+                let _section = stopwatch.start_section("host_export_ipfs_map");
+                instance.ipfs_map(
+                    link_ptr.into(),
+                    callback.into(),
+                    user_data.into(),
+                    flags.into(),
+                )
+            },
+        )?;
+
+        link!("store.remove", store_remove, entity_ptr, id_ptr);
+
+        link!("typeConversion.bytesToString", bytes_to_string, ptr);
+        link!("typeConversion.bytesToHex", bytes_to_hex, ptr);
+        link!("typeConversion.bigIntToString", big_int_to_string, ptr);
+        link!("typeConversion.bigIntToHex", big_int_to_hex, ptr);
+        link!("typeConversion.stringToH160", string_to_h160, ptr);
+        link!("typeConversion.bytes_to_base58", bytes_to_base58, ptr);
+
+        link!("json.fromBytes", json_from_bytes, ptr);
+        link!("json.try_FromBytes", json_try_from_bytes, ptr);
+        link!("json.toI64", json_to_i64, ptr);
+        link!("json.toU64", json_to_u64, ptr);
+        link!("json.toF64", json_to_f64, ptr);
+        link!("json.toBigInt", json_to_big_int, ptr);
+
+        link!("crypto.keccak256", crypto_keccak_256, ptr);
+
+        link!("bigInt.plus", big_int_plus, x_ptr, y_ptr);
+        link!("bigInt.minus", big_int_minus, x_ptr, y_ptr);
+        link!("bigInt.times", big_int_times, x_ptr, y_ptr);
+        link!("bigInt.diviedBy", big_int_divided_by, x_ptr, y_ptr);
+        link!("bigInt.dividedByDecimal", big_int_divided_by_decimal, x, y);
+        link!("bigInt.mod", big_int_mod, x_ptr, y_ptr);
+        link!("bigInt.pow", big_int_pow, x_ptr, exp);
+
+        link!("bigDecimal.toString", big_decimal_to_string, ptr);
+        link!("bigDecimal.fromString", big_decimal_from_string, ptr);
+        link!("bigDecimal.plus", big_decimal_plus, x_ptr, y_ptr);
+        link!("bigDecimal.minus", big_decimal_minus, x_ptr, y_ptr);
+        link!("bigDecimal.times", big_decimal_times, x_ptr, y_ptr);
+        link!("bigDecimal.divided_by", big_decimal_divided_by, x, y);
+        link!("bigDecimal.equals", big_decimal_equals, x_ptr, y_ptr);
+
+        link!("dataSource.create", data_source_create, name, params);
+        link!(
+            "dataSource.createWithContext",
+            data_source_create_with_context,
+            name,
+            params,
+            context
         );
+        link!("dataSource.address", data_source_address,);
+        link!("dataSource.network", data_source_network,);
+        link!("dataSource.context", data_source_context,);
 
-        link!("crypto.keccak256", crypto_keccak_256, ptr: i32);
+        link!("ens.nameByHash", ens_name_by_hash, ptr);
 
-        link!("bigInt.plus", big_int_plus, x_ptr: i32, y_ptr: i32);
-        link!("bigInt.minus", big_int_minus, x_ptr: i32, y_ptr: i32);
-        link!("bigInt.times", big_int_times, x_ptr: i32, y_ptr: i32);
-        link!("bigInt.divedBy", big_int_divided_by, x_ptr: i32, y_ptr: i32);
+        link!("log.log", log_log, level, msg_ptr);
 
-        let module = linker.instantiate(&valid_module.module)?;
+        link!("arweave.transactionData", arweave_transaction_data, ptr);
+
+        link!("box.profile", box_profile, ptr);
+
+        let instance = linker.instantiate(&valid_module.module)?;
 
         // Provide access to the WASM runtime linear memory
-        let memory = module
+        let memory = instance
             .get_memory("memory")
             .context("Failed to find memory export in the WASM module")?;
 
-        let memory_allocate = module
+        let memory_allocate = instance
             .get_func("memory.allocate")
             .context("`memory.allocate` function not found")?
             .get1()?;
 
-        let this = WasmiModule {
-            module,
+        *shared_instance.borrow_mut() = Some(WasmInstance {
+            instance,
             memory_allocate: Box::new(memory_allocate),
             memory,
             ctx,
@@ -204,128 +395,15 @@ impl WasmiModule {
             // `arena_start_ptr` will be set on the first call to `raw_new`.
             arena_free_size: 0,
             arena_start_ptr: 0,
-        };
+        });
 
-        Ok(this)
-    }
-
-    pub(crate) fn handle_json_callback(
-        mut self,
-        handler_name: &str,
-        value: &serde_json::Value,
-        user_data: &store::Value,
-    ) -> Result<BlockState, anyhow::Error> {
-        let value = self.asc_new(value);
-        let user_data = self.asc_new(user_data);
-
-        // Invoke the callback
-        self.module
-            .get_func(handler_name)
-            .with_context(|| format!("function {} not found", handler_name))?
-            .get2()?(value.wasm_ptr(), user_data.wasm_ptr())
-        .with_context(|| format!("Failed to handle callback '{}'", handler_name))?;
-
-        Ok(self.ctx.state)
-    }
-
-    pub(crate) fn handle_ethereum_log(
-        mut self,
-        handler_name: &str,
-        transaction: Arc<Transaction>,
-        log: Arc<Log>,
-        params: Vec<LogParam>,
-    ) -> Result<BlockState, anyhow::Error> {
-        let block = self.ctx.block.clone();
-
-        // Prepare an EthereumEvent for the WASM runtime
-        // Decide on the destination type using the mapping
-        // api version provided in the subgraph manifest
-        let event = if self.ctx.host_exports.api_version >= Version::new(0, 0, 2) {
-            self.asc_new::<AscEthereumEvent<AscEthereumTransaction_0_0_2>, _>(&EthereumEventData {
-                block: EthereumBlockData::from(block.as_ref()),
-                transaction: EthereumTransactionData::from(transaction.deref()),
-                address: log.address,
-                log_index: log.log_index.unwrap_or(U256::zero()),
-                transaction_log_index: log.log_index.unwrap_or(U256::zero()),
-                log_type: log.log_type.clone(),
-                params,
-            })
-            .erase()
-        } else {
-            self.asc_new::<AscEthereumEvent<AscEthereumTransaction>, _>(&EthereumEventData {
-                block: EthereumBlockData::from(block.as_ref()),
-                transaction: EthereumTransactionData::from(transaction.deref()),
-                address: log.address,
-                log_index: log.log_index.unwrap_or(U256::zero()),
-                transaction_log_index: log.log_index.unwrap_or(U256::zero()),
-                log_type: log.log_type.clone(),
-                params,
-            })
-            .erase()
-        };
-
-        // Invoke the event handler
-        self.invoke_handler(handler_name, event)?;
-
-        // Return the output state
-        Ok(self.ctx.state)
-    }
-
-    pub(crate) fn handle_ethereum_call(
-        mut self,
-        handler_name: &str,
-        transaction: Arc<Transaction>,
-        call: Arc<EthereumCall>,
-        inputs: Vec<LogParam>,
-        outputs: Vec<LogParam>,
-    ) -> Result<BlockState, anyhow::Error> {
-        let call = EthereumCallData {
-            to: call.to,
-            from: call.from,
-            block: EthereumBlockData::from(self.ctx.block.as_ref()),
-            transaction: EthereumTransactionData::from(transaction.deref()),
-            inputs,
-            outputs,
-        };
-        let arg = if self.ctx.host_exports.api_version >= Version::new(0, 0, 3) {
-            self.asc_new::<AscEthereumCall_0_0_3, _>(&call).erase()
-        } else {
-            self.asc_new::<AscEthereumCall, _>(&call).erase()
-        };
-
-        self.invoke_handler(handler_name, arg)?;
-
-        Ok(self.ctx.state)
-    }
-
-    pub(crate) fn handle_ethereum_block(
-        mut self,
-        handler_name: &str,
-    ) -> Result<BlockState, anyhow::Error> {
-        // Prepare an EthereumBlock for the WASM runtime
-        let arg = self.asc_new(&EthereumBlockData::from(self.ctx.block.as_ref()));
-
-        self.invoke_handler(handler_name, arg)?;
-
-        Ok(self.ctx.state)
-    }
-
-    fn invoke_handler<C>(&self, handler: &str, arg: AscPtr<C>) -> Result<(), anyhow::Error> {
-        self.module
-            .get_func(handler)
-            .with_context(|| format!("function {} not found", handler))?
-            .get1()?(arg.wasm_ptr())
-        .with_context(|| format!("Failed to invoke handler '{}'", handler))
-    }
-
-    fn stopwatch_host_export_other(&self) -> graph::components::metrics::stopwatch::Section {
-        self.host_metrics
-            .stopwatch
-            .start_section("host_export_other")
+        Ok(WasmInstanceHandle {
+            instance: shared_instance.clone(),
+        })
     }
 }
 
-impl AscHeap for WasmiModule {
+impl AscHeap for WasmInstance {
     fn raw_new(&mut self, bytes: &[u8]) -> u32 {
         // We request large chunks from the AssemblyScript allocator to use as arenas that we
         // manage directly.
@@ -361,7 +439,7 @@ impl AscHeap for WasmiModule {
 }
 
 // Implementation of externals.
-impl WasmiModule {
+impl WasmInstance {
     /// function abort(message?: string | null, fileName?: string | null, lineNumber?: u32, columnNumber?: u32): void
     /// Always returns a trap.
     fn abort(
@@ -746,8 +824,9 @@ impl WasmiModule {
     fn big_int_pow(
         &mut self,
         x_ptr: AscPtr<AscBigInt>,
-        exp: u8,
+        exp: i32,
     ) -> Result<AscPtr<AscBigInt>, Trap> {
+        let exp = u8::try_from(exp).map_err(anyhow::Error::from)?;
         let result = self.ctx.host_exports.big_int_pow(self.asc_get(x_ptr), exp);
         let result_ptr: AscPtr<AscBigInt> = self.asc_new(&result);
         Ok(result_ptr)
@@ -941,219 +1020,5 @@ impl WasmiModule {
         Ok(profile
             .map(|profile| self.asc_new(&profile))
             .unwrap_or(AscPtr::null()))
-    }
-}
-
-#[cfg(any())]
-impl Externals for WasmiModule {
-    fn invoke_index(&mut self, index: usize, args: RuntimeArgs) -> Result<AscPtr<()>, Trap> {
-        // Start a catch-all section for exports that don't have their own section.
-        let stopwatch = self.host_metrics.stopwatch.clone();
-        let _section = stopwatch.start_section("host_export_other");
-        let start = Instant::now();
-        let res = match index {
-            STORE_SET_FUNC_INDEX => {
-                let _section = stopwatch.start_section("host_export_store_set");
-                self.store_set(
-                    args.nth_checked(0)?,
-                    args.nth_checked(1)?,
-                    args.nth_checked(2)?,
-                )
-            }
-            STORE_GET_FUNC_INDEX => {
-                let _section = stopwatch.start_section("host_export_store_get");
-                self.store_get(args.nth_checked(0)?, args.nth_checked(1)?)
-            }
-            STORE_REMOVE_FUNC_INDEX => {
-                self.store_remove(args.nth_checked(0)?, args.nth_checked(1)?)
-            }
-            ETHEREUM_CALL_FUNC_INDEX => {
-                let _section = stopwatch.start_section("host_export_ethereum_call");
-
-                // For apiVersion >= 0.0.4 the call passed from the mapping includes the
-                // function signature; subgraphs using an apiVersion < 0.0.4 don't pass
-                // the the signature along with the call.
-                let arg = if self.ctx.host_exports.api_version >= Version::new(0, 0, 4) {
-                    self.asc_get::<_, AscUnresolvedContractCall_0_0_4>(args.nth_checked(0)?)
-                } else {
-                    self.asc_get::<_, AscUnresolvedContractCall>(args.nth_checked(0)?)
-                };
-
-                self.ethereum_call(arg)
-            }
-            TYPE_CONVERSION_BYTES_TO_STRING_FUNC_INDEX => {
-                self.bytes_to_string(args.nth_checked(0)?)
-            }
-            TYPE_CONVERSION_BYTES_TO_HEX_FUNC_INDEX => self.bytes_to_hex(args.nth_checked(0)?),
-            TYPE_CONVERSION_BIG_INT_TO_STRING_FUNC_INDEX => {
-                self.big_int_to_string(args.nth_checked(0)?)
-            }
-            TYPE_CONVERSION_BIG_INT_TO_HEX_FUNC_INDEX => self.big_int_to_hex(args.nth_checked(0)?),
-            TYPE_CONVERSION_STRING_TO_H160_FUNC_INDEX => self.string_to_h160(args.nth_checked(0)?),
-            JSON_FROM_BYTES_FUNC_INDEX => self.json_from_bytes(args.nth_checked(0)?),
-            JSON_TO_I64_FUNC_INDEX => self.json_to_i64(args.nth_checked(0)?),
-            JSON_TO_U64_FUNC_INDEX => self.json_to_u64(args.nth_checked(0)?),
-            JSON_TO_F64_FUNC_INDEX => self.json_to_f64(args.nth_checked(0)?),
-            JSON_TO_BIG_INT_FUNC_INDEX => self.json_to_big_int(args.nth_checked(0)?),
-            IPFS_CAT_FUNC_INDEX => {
-                let _section = stopwatch.start_section("host_export_ipfs_cat");
-                self.ipfs_cat(args.nth_checked(0)?)
-            }
-            CRYPTO_KECCAK_256_INDEX => self.crypto_keccak_256(args.nth_checked(0)?),
-            BIG_INT_PLUS => self.big_int_plus(args.nth_checked(0)?, args.nth_checked(1)?),
-            BIG_INT_MINUS => self.big_int_minus(args.nth_checked(0)?, args.nth_checked(1)?),
-            BIG_INT_TIMES => self.big_int_times(args.nth_checked(0)?, args.nth_checked(1)?),
-            BIG_INT_DIVIDED_BY => {
-                self.big_int_divided_by(args.nth_checked(0)?, args.nth_checked(1)?)
-            }
-            BIG_INT_DIVIDED_BY_DECIMAL => {
-                self.big_int_divided_by_decimal(args.nth_checked(0)?, args.nth_checked(1)?)
-            }
-            BIG_INT_MOD => self.big_int_mod(args.nth_checked(0)?, args.nth_checked(1)?),
-            BIG_INT_POW => self.big_int_pow(args.nth_checked(0)?, args.nth_checked(1)?),
-            TYPE_CONVERSION_BYTES_TO_BASE_58_INDEX => self.bytes_to_base58(args.nth_checked(0)?),
-            BIG_DECIMAL_PLUS => self.big_decimal_plus(args.nth_checked(0)?, args.nth_checked(1)?),
-            BIG_DECIMAL_MINUS => self.big_decimal_minus(args.nth_checked(0)?, args.nth_checked(1)?),
-            BIG_DECIMAL_TIMES => self.big_decimal_times(args.nth_checked(0)?, args.nth_checked(1)?),
-            BIG_DECIMAL_DIVIDED_BY => {
-                self.big_decimal_divided_by(args.nth_checked(0)?, args.nth_checked(1)?)
-            }
-            BIG_DECIMAL_EQUALS => {
-                self.big_decimal_equals(args.nth_checked(0)?, args.nth_checked(1)?)
-            }
-            BIG_DECIMAL_TO_STRING => self.big_decimal_to_string(args.nth_checked(0)?),
-            BIG_DECIMAL_FROM_STRING => self.big_decimal_from_string(args.nth_checked(0)?),
-            IPFS_MAP_FUNC_INDEX => {
-                let _section = stopwatch.start_section("host_export_ipfs_map");
-                self.ipfs_map(
-                    args.nth_checked(0)?,
-                    args.nth_checked(1)?,
-                    args.nth_checked(2)?,
-                    args.nth_checked(3)?,
-                )
-            }
-            DATA_SOURCE_CREATE_INDEX => {
-                self.data_source_create(args.nth_checked(0)?, args.nth_checked(1)?)
-            }
-            ENS_NAME_BY_HASH => self.ens_name_by_hash(args.nth_checked(0)?),
-            LOG_LOG => self.log_log(args.nth_checked(0)?, args.nth_checked(1)?),
-            DATA_SOURCE_ADDRESS => self.data_source_address(),
-            DATA_SOURCE_NETWORK => self.data_source_network(),
-            DATA_SOURCE_CREATE_WITH_CONTEXT => self.data_source_create_with_context(
-                args.nth_checked(0)?,
-                args.nth_checked(1)?,
-                args.nth_checked(2)?,
-            ),
-            DATA_SOURCE_CONTEXT => self.data_source_context(),
-            JSON_TRY_FROM_BYTES_FUNC_INDEX => self.json_try_from_bytes(args.nth_checked(0)?),
-            ARWEAVE_TRANSACTION_DATA => self.arweave_transaction_data(args.nth_checked(0)?),
-            BOX_PROFILE => self.box_profile(args.nth_checked(0)?),
-            _ => panic!("Unimplemented function at {}", index),
-        };
-
-        res
-    }
-}
-
-pub struct ModuleResolver;
-
-#[cfg(any())]
-impl ModuleImportResolver for ModuleResolver {
-    fn resolve_func(&self, field_name: &str, signature: &Signature) -> Result<FuncRef, Error> {
-        let signature = signature.clone();
-        Ok(match field_name {
-            // store
-            "store.set" => FuncInstance::alloc_host(signature, STORE_SET_FUNC_INDEX),
-            "store.remove" => FuncInstance::alloc_host(signature, STORE_REMOVE_FUNC_INDEX),
-            "store.get" => FuncInstance::alloc_host(signature, STORE_GET_FUNC_INDEX),
-
-            // ethereum
-            "ethereum.call" => FuncInstance::alloc_host(signature, ETHEREUM_CALL_FUNC_INDEX),
-
-            // typeConversion
-            "typeConversion.bytesToString" => {
-                FuncInstance::alloc_host(signature, TYPE_CONVERSION_BYTES_TO_STRING_FUNC_INDEX)
-            }
-            "typeConversion.bytesToHex" => {
-                FuncInstance::alloc_host(signature, TYPE_CONVERSION_BYTES_TO_HEX_FUNC_INDEX)
-            }
-            "typeConversion.bigIntToString" => {
-                FuncInstance::alloc_host(signature, TYPE_CONVERSION_BIG_INT_TO_STRING_FUNC_INDEX)
-            }
-            "typeConversion.bigIntToHex" => {
-                FuncInstance::alloc_host(signature, TYPE_CONVERSION_BIG_INT_TO_HEX_FUNC_INDEX)
-            }
-            "typeConversion.stringToH160" => {
-                FuncInstance::alloc_host(signature, TYPE_CONVERSION_STRING_TO_H160_FUNC_INDEX)
-            }
-            "typeConversion.bytesToBase58" => {
-                FuncInstance::alloc_host(signature, TYPE_CONVERSION_BYTES_TO_BASE_58_INDEX)
-            }
-
-            // json
-            "json.fromBytes" => FuncInstance::alloc_host(signature, JSON_FROM_BYTES_FUNC_INDEX),
-            "json.try_fromBytes" => {
-                FuncInstance::alloc_host(signature, JSON_TRY_FROM_BYTES_FUNC_INDEX)
-            }
-            "json.toI64" => FuncInstance::alloc_host(signature, JSON_TO_I64_FUNC_INDEX),
-            "json.toU64" => FuncInstance::alloc_host(signature, JSON_TO_U64_FUNC_INDEX),
-            "json.toF64" => FuncInstance::alloc_host(signature, JSON_TO_F64_FUNC_INDEX),
-            "json.toBigInt" => FuncInstance::alloc_host(signature, JSON_TO_BIG_INT_FUNC_INDEX),
-
-            // ipfs
-            "ipfs.cat" => FuncInstance::alloc_host(signature, IPFS_CAT_FUNC_INDEX),
-            "ipfs.map" => FuncInstance::alloc_host(signature, IPFS_MAP_FUNC_INDEX),
-
-            // crypto
-            "crypto.keccak256" => FuncInstance::alloc_host(signature, CRYPTO_KECCAK_256_INDEX),
-
-            // bigInt
-            "bigInt.plus" => FuncInstance::alloc_host(signature, BIG_INT_PLUS),
-            "bigInt.minus" => FuncInstance::alloc_host(signature, BIG_INT_MINUS),
-            "bigInt.times" => FuncInstance::alloc_host(signature, BIG_INT_TIMES),
-            "bigInt.dividedBy" => FuncInstance::alloc_host(signature, BIG_INT_DIVIDED_BY),
-            "bigInt.dividedByDecimal" => {
-                FuncInstance::alloc_host(signature, BIG_INT_DIVIDED_BY_DECIMAL)
-            }
-            "bigInt.mod" => FuncInstance::alloc_host(signature, BIG_INT_MOD),
-            "bigInt.pow" => FuncInstance::alloc_host(signature, BIG_INT_POW),
-
-            // bigDecimal
-            "bigDecimal.plus" => FuncInstance::alloc_host(signature, BIG_DECIMAL_PLUS),
-            "bigDecimal.minus" => FuncInstance::alloc_host(signature, BIG_DECIMAL_MINUS),
-            "bigDecimal.times" => FuncInstance::alloc_host(signature, BIG_DECIMAL_TIMES),
-            "bigDecimal.dividedBy" => FuncInstance::alloc_host(signature, BIG_DECIMAL_DIVIDED_BY),
-            "bigDecimal.equals" => FuncInstance::alloc_host(signature, BIG_DECIMAL_EQUALS),
-            "bigDecimal.toString" => FuncInstance::alloc_host(signature, BIG_DECIMAL_TO_STRING),
-            "bigDecimal.fromString" => FuncInstance::alloc_host(signature, BIG_DECIMAL_FROM_STRING),
-
-            // dataSource
-            "dataSource.create" => FuncInstance::alloc_host(signature, DATA_SOURCE_CREATE_INDEX),
-            "dataSource.address" => FuncInstance::alloc_host(signature, DATA_SOURCE_ADDRESS),
-            "dataSource.network" => FuncInstance::alloc_host(signature, DATA_SOURCE_NETWORK),
-            "dataSource.createWithContext" => {
-                FuncInstance::alloc_host(signature, DATA_SOURCE_CREATE_WITH_CONTEXT)
-            }
-            "dataSource.context" => FuncInstance::alloc_host(signature, DATA_SOURCE_CONTEXT),
-
-            // ens.nameByHash
-            "ens.nameByHash" => FuncInstance::alloc_host(signature, ENS_NAME_BY_HASH),
-
-            // log.log
-            "log.log" => FuncInstance::alloc_host(signature, LOG_LOG),
-
-            "arweave.transactionData" => {
-                FuncInstance::alloc_host(signature, ARWEAVE_TRANSACTION_DATA)
-            }
-            "box.profile" => FuncInstance::alloc_host(signature, BOX_PROFILE),
-
-            // Unknown export
-            _ => {
-                return Err(Error::Instantiation(format!(
-                    "Export '{}' not found",
-                    field_name
-                )));
-            }
-        })
     }
 }

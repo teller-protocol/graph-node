@@ -1,4 +1,4 @@
-use crate::module::WasmiModule;
+use crate::module::WasmInstance;
 use ethabi::LogParam;
 use futures::sync::mpsc;
 use futures03::channel::oneshot::Sender;
@@ -43,9 +43,9 @@ pub fn spawn_module(
                         result_sender,
                     } = request;
 
-                    // Start the WASMI module runtime.
+                    // Start the WASM module runtime.
                     let section = host_metrics.stopwatch.start_section("module_init");
-                    let module = WasmiModule::from_valid_module_with_ctx(
+                    let module = WasmInstance::from_valid_module_with_ctx(
                         valid_module.clone(),
                         ctx,
                         host_metrics.clone(),
@@ -155,7 +155,7 @@ impl MappingContext {
     }
 }
 
-/// A pre-processed and valid WASM module, ready to be started as a WasmiModule.
+/// A pre-processed and valid WASM module, ready to be started as a WasmModule.
 pub(crate) struct ValidModule {
     pub(super) module: wasmtime::Module,
     pub(super) user_module: String,

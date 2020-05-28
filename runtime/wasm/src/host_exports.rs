@@ -18,7 +18,7 @@ use web3::types::H160;
 
 use graph_graphql::prelude::validate_entity;
 
-use crate::module::WasmiModule;
+use crate::module::WasmInstance;
 
 pub(crate) struct HostExports {
     subgraph_id: SubgraphDeploymentId,
@@ -339,19 +339,6 @@ impl HostExports {
         format!("0x{}", ::hex::encode(bytes).trim_start_matches('0'))
     }
 
-    pub(crate) fn big_int_to_i32(&self, n: BigInt) -> Result<i32, anyhow::Error> {
-        anyhow::ensure!(
-            n >= i32::min_value().into() && n <= i32::max_value().into(),
-            "BigInt value does not fit into i32: {}",
-            n
-        );
-        let n_bytes = n.to_signed_bytes_le();
-        let mut i_bytes: [u8; 4] = if n < 0.into() { [255; 4] } else { [0; 4] };
-        i_bytes[..n_bytes.len()].copy_from_slice(&n_bytes);
-        let i = i32::from_le_bytes(i_bytes);
-        Ok(i)
-    }
-
     pub(crate) fn ipfs_cat(&self, logger: &Logger, link: String) -> Result<Vec<u8>, anyhow::Error> {
         use graph::prelude::failure::ResultExt;
 
@@ -367,7 +354,7 @@ impl HostExports {
     // parameter is passed to the callback without any changes
     pub(crate) fn ipfs_map(
         link_resolver: &Arc<dyn LinkResolver>,
-        module: &mut WasmiModule,
+        module: &mut WasmInstance,
         link: String,
         callback: &str,
         user_data: store::Value,
@@ -401,7 +388,7 @@ impl HostExports {
             let mut v = Vec::new();
             while let Some(sv) = block_on03(stream.next()) {
                 let sv = sv.compat()?;
-                let module = WasmiModule::from_valid_module_with_ctx(
+                let module = WasmInstance::from_valid_module_with_ctx(
                     valid_module.clone(),
                     ctx.derive_with_empty_block_state(),
                     host_metrics.clone(),

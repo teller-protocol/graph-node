@@ -27,7 +27,7 @@ fn test_valid_module_and_store(
     subgraph_id: &str,
     data_source: DataSource,
 ) -> (
-    WasmiModule,
+    WasmInstanceHandle,
     Arc<impl Store + SubgraphDeploymentStore + EthereumCallCache>,
 ) {
     let store = STORE.clone();
@@ -57,7 +57,7 @@ fn test_valid_module_and_store(
         stopwatch_metrics,
     ));
 
-    let module = WasmiModule::from_valid_module_with_ctx(
+    let module = WasmInstance::from_valid_module_with_ctx(
         Arc::new(ValidModule::new(data_source.mapping.runtime.as_ref()).unwrap()),
         mock_context(deployment_id, data_source, store.clone()),
         host_metrics,
@@ -67,7 +67,7 @@ fn test_valid_module_and_store(
     (module, store)
 }
 
-fn test_module(subgraph_id: &str, data_source: DataSource) -> WasmiModule {
+fn test_module(subgraph_id: &str, data_source: DataSource) -> WasmInstanceHandle {
     test_valid_module_and_store(subgraph_id, data_source).0
 }
 
@@ -170,15 +170,19 @@ fn mock_context(
     }
 }
 
-impl WasmiModule {
+impl WasmInstanceHandle {
+    fn get_func(&self, name: &str) -> wasmtime::Func {
+        self.borrow_instance().instance.get_func(name).unwrap()
+    }
+
     fn invoke_export<C, R>(&self, f: &str, arg: AscPtr<C>) -> AscPtr<R> {
-        let func = self.module.get_func(f).unwrap().get1().unwrap();
+        let func = self.get_func(f).get1().unwrap();
         let ptr: i32 = func(arg.wasm_ptr()).unwrap();
         ptr.into()
     }
 
     fn invoke_export2<C, D, R>(&self, f: &str, arg0: AscPtr<C>, arg1: AscPtr<D>) -> AscPtr<R> {
-        let func = self.module.get_func(f).unwrap().get2().unwrap();
+        let func = self.get_func(f).get2().unwrap();
         let ptr: i32 = func(arg0.wasm_ptr(), arg1.wasm_ptr()).unwrap();
         ptr.into()
     }
@@ -189,19 +193,29 @@ impl WasmiModule {
         arg0: AscPtr<C>,
         arg1: AscPtr<D>,
     ) -> Result<(), wasmtime::Trap> {
-        let func = self.module.get_func(f).unwrap().get2().unwrap();
+        let func = self.get_func(f).get2().unwrap();
         func(arg0.wasm_ptr(), arg1.wasm_ptr())
     }
 
     fn takes_ptr_returns_val<P, V: wasmtime::WasmTy>(&mut self, fn_name: &str, v: AscPtr<P>) -> V {
-        let func = self.module.get_func(fn_name).unwrap().get1().unwrap();
+        let func = self.get_func(fn_name).get1().unwrap();
         func(v.wasm_ptr()).unwrap()
     }
 
     fn takes_val_returns_ptr<P>(&mut self, fn_name: &str, val: impl wasmtime::WasmTy) -> AscPtr<P> {
-        let func = self.module.get_func(fn_name).unwrap().get1().unwrap();
+        let func = self.get_func(fn_name).get1().unwrap();
         let ptr: i32 = func(val).unwrap();
         ptr.into()
+    }
+}
+
+impl AscHeap for WasmInstanceHandle {
+    fn raw_new(&mut self, bytes: &[u8]) -> u32 {
+        self.instance().raw_new(bytes)
+    }
+
+    fn get(&self, offset: u32, size: u32) -> Vec<u8> {
+        self.borrow_instance().get(offset, size)
     }
 }
 
@@ -261,7 +275,7 @@ fn json_parsing() {
     let bytes: &[u8] = s.as_ref();
     let bytes_ptr = module.asc_new(bytes);
     let return_value: AscPtr<AscString> = module.invoke_export("handleJsonError", bytes_ptr);
-    let output: String = module.asc_get(return_value);
+    let output: String = module.instance().asc_get(return_value);
     assert_eq!(output, "OK: foo");
 }
 
@@ -274,7 +288,7 @@ async fn ipfs_cat() {
         let mut module = test_module("ipfsCat", mock_data_source("wasm_test/ipfs_cat.wasm"));
         let arg = module.asc_new(&hash);
         let converted: AscPtr<AscString> = module.invoke_export("ipfsCatString", arg);
-        let data: String = module.asc_get(converted);
+        let data: String = module.instance().asc_get(converted);
         assert_eq!(data, "42");
     })
     .await
@@ -319,14 +333,21 @@ async fn ipfs_map() {
         } else {
             ipfs.add(Cursor::new(json_string)).await.unwrap().hash
         };
-        let value = module.asc_new(&hash);
-        let user_data = module.asc_new(USER_DATA);
+        let value = module.instance().asc_new(&hash);
+        let user_data = module.instance().asc_new(USER_DATA);
 
         // Invoke the callback
-        let func = module.module.get_func("ipfsMap").unwrap().get2().unwrap();
+        let func = module
+            .instance()
+            .instance
+            .get_func("ipfsMap")
+            .unwrap()
+            .get2()
+            .unwrap();
         let _: () = func(value.wasm_ptr(), user_data.wasm_ptr()).unwrap();
 
         let mut mods = module
+            .take_instance()
             .ctx
             .state
             .entity_cache
@@ -396,7 +417,7 @@ async fn ipfs_fail() {
     graph::spawn_blocking(async {
         let mut module = test_module("ipfsFail", mock_data_source("wasm_test/ipfs_cat.wasm"));
 
-        let hash = module.asc_new("invalid hash");
+        let hash = module.instance().asc_new("invalid hash");
         assert!(module
             .invoke_export::<_, AscString>("ipfsCat", hash,)
             .is_null());
@@ -550,8 +571,14 @@ fn big_int_arithmetic() {
 
 #[test]
 fn abort() {
-    let module = test_module("abort", mock_data_source("wasm_test/abort.wasm"));
-    let func = module.module.get_func("abort").unwrap().get0().unwrap();
+    let mut module = test_module("abort", mock_data_source("wasm_test/abort.wasm"));
+    let func = module
+        .instance()
+        .instance
+        .get_func("abort")
+        .unwrap()
+        .get0()
+        .unwrap();
     let res: Result<(), _> = func();
     assert_eq!(res.unwrap_err().to_string(), "Trap: Trap { kind: Host(HostExportError(\"Mapping aborted at abort.ts, line 6, column 2, with message: not true\")) }");
 }
@@ -583,7 +610,7 @@ fn data_source_create() {
         let name = module.asc_new(&name);
         let params = module.asc_new(&*params);
         module.invoke_export2_void("dataSourceCreate", name, params)?;
-        Ok(module.ctx.state.created_data_sources)
+        Ok(module.take_instance().ctx.state.created_data_sources)
     };
 
     // Test with a valid template
@@ -647,7 +674,7 @@ fn entity_store() {
     let subgraph_id = SubgraphDeploymentId::new("entityStore").unwrap();
     test_store::insert_entities(subgraph_id, vec![("User", alex), ("User", steve)]).unwrap();
 
-    let get_user = move |module: &mut WasmiModule, id: &str| -> Option<Entity> {
+    let get_user = move |module: &mut WasmInstanceHandle, id: &str| -> Option<Entity> {
         let id = module.asc_new(id);
         let entity_ptr: AscPtr<AscEntity> = module.invoke_export("getUser", id);
         if entity_ptr.is_null() {
@@ -661,7 +688,7 @@ fn entity_store() {
         }
     };
 
-    let load_and_set_user_name = |module: &mut WasmiModule, id: &str, name: &str| {
+    let load_and_set_user_name = |module: &mut WasmInstanceHandle, id: &str, name: &str| {
         let id_ptr = module.asc_new(id);
         let name_ptr = module.asc_new(name);
         module
@@ -678,6 +705,7 @@ fn entity_store() {
     // Load, set, save cycle for an existing entity
     load_and_set_user_name(&mut module, "steve", "Steve-O");
     let mut mods = module
+        .take_instance()
         .ctx
         .state
         .entity_cache
@@ -694,13 +722,14 @@ fn entity_store() {
     }
 
     // Load, set, save cycle for a new entity with fulltext API
-    module.ctx.state.entity_cache = EntityCache::new(store.clone());
+    module.instance().ctx.state.entity_cache = EntityCache::new(store.clone());
     load_and_set_user_name(&mut module, "herobrine", "Brine-O");
     let mut fulltext_entities = BTreeMap::new();
     let mut fulltext_fields = BTreeMap::new();
     fulltext_fields.insert("name".to_string(), vec!["search".to_string()]);
     fulltext_entities.insert("User".to_string(), fulltext_fields);
     let mut mods = module
+        .take_instance()
         .ctx
         .state
         .entity_cache
