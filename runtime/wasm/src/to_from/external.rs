@@ -5,9 +5,9 @@ use graph::components::ethereum::{
     EthereumBlockData, EthereumCallData, EthereumEventData, EthereumTransactionData,
 };
 use graph::data::store;
+use graph::prelude::anyhow::{self, Error};
 use graph::prelude::serde_json;
 use graph::prelude::web3::types as web3;
-use graph::prelude::{format_err, Error};
 use graph::prelude::{BigDecimal, BigInt};
 
 use crate::asc_abi::class::*;
@@ -84,12 +84,12 @@ impl TryFromAscObj<AscBigDecimal> for BigDecimal {
         let exp: BigInt = heap.asc_get(big_decimal.exp);
 
         if exp < BIG_DECIMAL_MIN_EXP.into() || exp > BIG_DECIMAL_MAX_EXP.into() {
-            return Err(format_err!(
+            anyhow::bail!(
                 "big decimal exponent `{}` is outside the `{}` to `{}` range",
                 exp,
                 BIG_DECIMAL_MIN_EXP,
-                BIG_DECIMAL_MAX_EXP
-            ));
+                BIG_DECIMAL_MAX_EXP,
+            );
         }
         let bytes = exp.to_signed_bytes_le();
         let mut byte_array = if exp >= 0.into() { [0; 8] } else { [255; 8] };

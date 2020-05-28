@@ -90,11 +90,11 @@ where
     type Req = MappingRequest;
 
     fn spawn_mapping(
-        raw_module: &[u8],
+        raw_module: Vec<u8>,
         logger: Logger,
         subgraph_id: SubgraphDeploymentId,
         metrics: Arc<HostMetrics>,
-    ) -> Result<Sender<Self::Req>, Error> {
+    ) -> Result<Sender<Self::Req>, anyhow::Error> {
         crate::mapping::spawn_module(
             raw_module,
             logger,
@@ -391,7 +391,7 @@ impl RuntimeHost {
         trigger: MappingTrigger,
         block: &Arc<LightEthereumBlock>,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, failure::Error> {
+    ) -> Result<BlockState, anyhow::Error> {
         let trigger_type = trigger.as_static();
         debug!(
             logger, "Start processing Ethereum trigger";
@@ -418,13 +418,13 @@ impl RuntimeHost {
                 trigger,
                 result_sender,
             })
-            .map_err(|_| format_err!("Mapping terminated before passing in trigger"))
             .compat()
-            .await?;
+            .await
+            .context("Mapping terminated before passing in trigger")?;
 
         let (result, send_time) = result_receiver
             .await
-            .map_err(|_| format_err!("Mapping terminated before handling trigger"))?;
+            .context("Mapping terminated before handling trigger")?;
 
         let elapsed = start_time.elapsed();
         metrics.observe_handler_execution_time(elapsed.as_secs_f64(), handler);
@@ -578,6 +578,7 @@ impl RuntimeHostTrait for RuntimeHost {
             proof_of_indexing,
         )
         .await
+        .map_err(err_msg)
     }
 
     async fn process_block(
@@ -604,6 +605,7 @@ impl RuntimeHostTrait for RuntimeHost {
             proof_of_indexing,
         )
         .await
+        .map_err(err_msg)
     }
 
     async fn process_log(
@@ -717,5 +719,6 @@ impl RuntimeHostTrait for RuntimeHost {
             proof_of_indexing,
         )
         .await
+        .map_err(err_msg)
     }
 }
