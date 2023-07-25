@@ -1,82 +1,121 @@
 use ethabi;
-use std::collections::HashMap;
 
-use graph::components::ethereum::{
-    EthereumBlockData, EthereumCallData, EthereumEventData, EthereumTransactionData,
-};
-use graph::data::store;
-use graph::prelude::serde_json;
-use graph::prelude::web3::types as web3;
-use graph::prelude::{format_err, Error};
+use graph::data::value::Word;
 use graph::prelude::{BigDecimal, BigInt};
+use graph::runtime::gas::GasCounter;
+use graph::runtime::{
+    asc_get, asc_new, AscIndexId, AscPtr, AscType, AscValue, HostExportError, ToAscObj,
+};
+use graph::{data::store, runtime::DeterministicHostError};
+use graph::{prelude::serde_json, runtime::FromAscObj};
+use graph::{prelude::web3::types as web3, runtime::AscHeap};
 
 use crate::asc_abi::class::*;
-use crate::asc_abi::{AscHeap, AscPtr, AscType, FromAscObj, ToAscObj, TryFromAscObj};
-
-use crate::UnresolvedContractCall;
 
 impl ToAscObj<Uint8Array> for web3::H160 {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> Uint8Array {
-        self.0.to_asc_obj(heap)
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<Uint8Array, HostExportError> {
+        self.0.to_asc_obj(heap, gas)
     }
 }
 
 impl FromAscObj<Uint8Array> for web3::H160 {
-    fn from_asc_obj<H: AscHeap>(typed_array: Uint8Array, heap: &H) -> Self {
-        web3::H160(<[u8; 20]>::from_asc_obj(typed_array, heap))
+    fn from_asc_obj<H: AscHeap + ?Sized>(
+        typed_array: Uint8Array,
+        heap: &H,
+        gas: &GasCounter,
+        depth: usize,
+    ) -> Result<Self, DeterministicHostError> {
+        let data = <[u8; 20]>::from_asc_obj(typed_array, heap, gas, depth)?;
+        Ok(Self(data))
     }
 }
 
 impl FromAscObj<Uint8Array> for web3::H256 {
-    fn from_asc_obj<H: AscHeap>(typed_array: Uint8Array, heap: &H) -> Self {
-        web3::H256(<[u8; 32]>::from_asc_obj(typed_array, heap))
+    fn from_asc_obj<H: AscHeap + ?Sized>(
+        typed_array: Uint8Array,
+        heap: &H,
+        gas: &GasCounter,
+        depth: usize,
+    ) -> Result<Self, DeterministicHostError> {
+        let data = <[u8; 32]>::from_asc_obj(typed_array, heap, gas, depth)?;
+        Ok(Self(data))
     }
 }
 
 impl ToAscObj<Uint8Array> for web3::H256 {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> Uint8Array {
-        self.0.to_asc_obj(heap)
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<Uint8Array, HostExportError> {
+        self.0.to_asc_obj(heap, gas)
     }
 }
 
 impl ToAscObj<AscBigInt> for web3::U128 {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscBigInt {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscBigInt, HostExportError> {
         let mut bytes: [u8; 16] = [0; 16];
         self.to_little_endian(&mut bytes);
-        bytes.to_asc_obj(heap)
+        bytes.to_asc_obj(heap, gas)
     }
 }
 
 impl ToAscObj<AscBigInt> for BigInt {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscBigInt {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscBigInt, HostExportError> {
         let bytes = self.to_signed_bytes_le();
-        bytes.to_asc_obj(heap)
+        bytes.to_asc_obj(heap, gas)
     }
 }
 
 impl FromAscObj<AscBigInt> for BigInt {
-    fn from_asc_obj<H: AscHeap>(array_buffer: AscBigInt, heap: &H) -> Self {
-        let bytes = <Vec<u8>>::from_asc_obj(array_buffer, heap);
-        BigInt::from_signed_bytes_le(&bytes)
+    fn from_asc_obj<H: AscHeap + ?Sized>(
+        array_buffer: AscBigInt,
+        heap: &H,
+        gas: &GasCounter,
+        depth: usize,
+    ) -> Result<Self, DeterministicHostError> {
+        let bytes = <Vec<u8>>::from_asc_obj(array_buffer, heap, gas, depth)?;
+        Ok(BigInt::from_signed_bytes_le(&bytes)?)
     }
 }
 
 impl ToAscObj<AscBigDecimal> for BigDecimal {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscBigDecimal {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscBigDecimal, HostExportError> {
         // From the docs: "Note that a positive exponent indicates a negative power of 10",
         // so "exponent" is the opposite of what you'd expect.
         let (digits, negative_exp) = self.as_bigint_and_exponent();
-        AscBigDecimal {
-            exp: heap.asc_new(&BigInt::from(-negative_exp)),
-            digits: heap.asc_new(&BigInt::from(digits)),
-        }
+        Ok(AscBigDecimal {
+            exp: asc_new(heap, &BigInt::from(-negative_exp), gas)?,
+            digits: asc_new(heap, &BigInt::new(digits)?, gas)?,
+        })
     }
 }
 
-impl TryFromAscObj<AscBigDecimal> for BigDecimal {
-    fn try_from_asc_obj<H: AscHeap>(big_decimal: AscBigDecimal, heap: &H) -> Result<Self, Error> {
-        let digits: BigInt = heap.asc_get(big_decimal.digits);
-        let exp: BigInt = heap.asc_get(big_decimal.exp);
+impl FromAscObj<AscBigDecimal> for BigDecimal {
+    fn from_asc_obj<H: AscHeap + ?Sized>(
+        big_decimal: AscBigDecimal,
+        heap: &H,
+        gas: &GasCounter,
+        depth: usize,
+    ) -> Result<Self, DeterministicHostError> {
+        let digits: BigInt = asc_get(heap, big_decimal.digits, gas, depth)?;
+        let exp: BigInt = asc_get(heap, big_decimal.exp, gas, depth)?;
 
         let bytes = exp.to_signed_bytes_le();
         let mut byte_array = if exp >= 0.into() { [0; 8] } else { [255; 8] };
@@ -85,352 +124,275 @@ impl TryFromAscObj<AscBigDecimal> for BigDecimal {
 
         // Validate the exponent.
         let exp = -big_decimal.as_bigint_and_exponent().1;
-        if exp < BigDecimal::MIN_EXP.into() || exp > BigDecimal::MAX_EXP.into() {
-            return Err(format_err!(
+        let min_exp: i64 = BigDecimal::MIN_EXP.into();
+        let max_exp: i64 = BigDecimal::MAX_EXP.into();
+        if exp < min_exp || max_exp < exp {
+            Err(DeterministicHostError::from(anyhow::anyhow!(
                 "big decimal exponent `{}` is outside the `{}` to `{}` range",
                 exp,
-                BigDecimal::MIN_EXP,
-                BigDecimal::MAX_EXP
-            ));
+                min_exp,
+                max_exp
+            )))
+        } else {
+            Ok(big_decimal)
         }
-        Ok(big_decimal)
+    }
+}
+
+impl ToAscObj<Array<AscPtr<AscString>>> for Vec<String> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<Array<AscPtr<AscString>>, HostExportError> {
+        let content: Result<Vec<_>, _> = self.iter().map(|x| asc_new(heap, x, gas)).collect();
+        let content = content?;
+        Array::new(&content, heap, gas)
     }
 }
 
 impl ToAscObj<AscEnum<EthereumValueKind>> for ethabi::Token {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEnum<EthereumValueKind> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscEnum<EthereumValueKind>, HostExportError> {
         use ethabi::Token::*;
 
         let kind = EthereumValueKind::get_kind(self);
         let payload = match self {
-            Address(address) => heap.asc_new::<AscAddress, _>(address).to_payload(),
+            Address(address) => asc_new::<AscAddress, _, _>(heap, address, gas)?.to_payload(),
             FixedBytes(bytes) | Bytes(bytes) => {
-                heap.asc_new::<Uint8Array, _>(&**bytes).to_payload()
+                asc_new::<Uint8Array, _, _>(heap, &**bytes, gas)?.to_payload()
             }
             Int(uint) => {
-                let n = BigInt::from_signed_u256(&uint);
-                heap.asc_new(&n).to_payload()
+                let n = BigInt::from_signed_u256(uint);
+                asc_new(heap, &n, gas)?.to_payload()
             }
             Uint(uint) => {
-                let n = BigInt::from_unsigned_u256(&uint);
-                heap.asc_new(&n).to_payload()
+                let n = BigInt::from_unsigned_u256(uint);
+                asc_new(heap, &n, gas)?.to_payload()
             }
             Bool(b) => *b as u64,
-            String(string) => heap.asc_new(&**string).to_payload(),
-            FixedArray(tokens) | Array(tokens) => heap.asc_new(&**tokens).to_payload(),
-            Tuple(tokens) => heap.asc_new(&**tokens).to_payload(),
+            String(string) => asc_new(heap, &**string, gas)?.to_payload(),
+            FixedArray(tokens) | Array(tokens) => asc_new(heap, &**tokens, gas)?.to_payload(),
+            Tuple(tokens) => asc_new(heap, &**tokens, gas)?.to_payload(),
         };
 
-        AscEnum {
+        Ok(AscEnum {
             kind,
             _padding: 0,
             payload: EnumPayload(payload),
-        }
+        })
     }
 }
 
 impl FromAscObj<AscEnum<EthereumValueKind>> for ethabi::Token {
-    fn from_asc_obj<H: AscHeap>(asc_enum: AscEnum<EthereumValueKind>, heap: &H) -> Self {
+    fn from_asc_obj<H: AscHeap + ?Sized>(
+        asc_enum: AscEnum<EthereumValueKind>,
+        heap: &H,
+        gas: &GasCounter,
+        depth: usize,
+    ) -> Result<Self, DeterministicHostError> {
         use ethabi::Token;
 
         let payload = asc_enum.payload;
-        match asc_enum.kind {
+        Ok(match asc_enum.kind {
             EthereumValueKind::Bool => Token::Bool(bool::from(payload)),
             EthereumValueKind::Address => {
                 let ptr: AscPtr<AscAddress> = AscPtr::from(payload);
-                Token::Address(heap.asc_get(ptr))
+                Token::Address(asc_get(heap, ptr, gas, depth)?)
             }
             EthereumValueKind::FixedBytes => {
                 let ptr: AscPtr<Uint8Array> = AscPtr::from(payload);
-                Token::FixedBytes(heap.asc_get(ptr))
+                Token::FixedBytes(asc_get(heap, ptr, gas, depth)?)
             }
             EthereumValueKind::Bytes => {
                 let ptr: AscPtr<Uint8Array> = AscPtr::from(payload);
-                Token::Bytes(heap.asc_get(ptr))
+                Token::Bytes(asc_get(heap, ptr, gas, depth)?)
             }
             EthereumValueKind::Int => {
                 let ptr: AscPtr<AscBigInt> = AscPtr::from(payload);
-                let n: BigInt = heap.asc_get(ptr);
+                let n: BigInt = asc_get(heap, ptr, gas, depth)?;
                 Token::Int(n.to_signed_u256())
             }
             EthereumValueKind::Uint => {
                 let ptr: AscPtr<AscBigInt> = AscPtr::from(payload);
-                let n: BigInt = heap.asc_get(ptr);
+                let n: BigInt = asc_get(heap, ptr, gas, depth)?;
                 Token::Uint(n.to_unsigned_u256())
             }
             EthereumValueKind::String => {
                 let ptr: AscPtr<AscString> = AscPtr::from(payload);
-                Token::String(heap.asc_get(ptr))
+                Token::String(asc_get(heap, ptr, gas, depth)?)
             }
             EthereumValueKind::FixedArray => {
                 let ptr: AscEnumArray<EthereumValueKind> = AscPtr::from(payload);
-                Token::FixedArray(heap.asc_get(ptr))
+                Token::FixedArray(asc_get(heap, ptr, gas, depth)?)
             }
             EthereumValueKind::Array => {
                 let ptr: AscEnumArray<EthereumValueKind> = AscPtr::from(payload);
-                Token::Array(heap.asc_get(ptr))
+                Token::Array(asc_get(heap, ptr, gas, depth)?)
             }
             EthereumValueKind::Tuple => {
                 let ptr: AscEnumArray<EthereumValueKind> = AscPtr::from(payload);
-                Token::Tuple(heap.asc_get(ptr))
+                Token::Tuple(asc_get(heap, ptr, gas, depth)?)
             }
-        }
+        })
     }
 }
 
-impl TryFromAscObj<AscEnum<StoreValueKind>> for store::Value {
-    fn try_from_asc_obj<H: AscHeap>(
+impl FromAscObj<AscEnum<StoreValueKind>> for store::Value {
+    fn from_asc_obj<H: AscHeap + ?Sized>(
         asc_enum: AscEnum<StoreValueKind>,
         heap: &H,
-    ) -> Result<Self, Error> {
+        gas: &GasCounter,
+        depth: usize,
+    ) -> Result<Self, DeterministicHostError> {
         use self::store::Value;
 
         let payload = asc_enum.payload;
         Ok(match asc_enum.kind {
             StoreValueKind::String => {
                 let ptr: AscPtr<AscString> = AscPtr::from(payload);
-                Value::String(heap.asc_get(ptr))
+                Value::String(asc_get(heap, ptr, gas, depth)?)
             }
             StoreValueKind::Int => Value::Int(i32::from(payload)),
+            StoreValueKind::Int8 => Value::Int8(i64::from(payload)),
             StoreValueKind::BigDecimal => {
                 let ptr: AscPtr<AscBigDecimal> = AscPtr::from(payload);
-                Value::BigDecimal(heap.try_asc_get(ptr)?)
+                Value::BigDecimal(asc_get(heap, ptr, gas, depth)?)
             }
             StoreValueKind::Bool => Value::Bool(bool::from(payload)),
             StoreValueKind::Array => {
                 let ptr: AscEnumArray<StoreValueKind> = AscPtr::from(payload);
-                Value::List(heap.try_asc_get(ptr)?)
+                Value::List(asc_get(heap, ptr, gas, depth)?)
             }
             StoreValueKind::Null => Value::Null,
             StoreValueKind::Bytes => {
-                let ptr: AscPtr<Bytes> = AscPtr::from(payload);
-                let array: Vec<u8> = heap.asc_get(ptr);
+                let ptr: AscPtr<Uint8Array> = AscPtr::from(payload);
+                let array: Vec<u8> = asc_get(heap, ptr, gas, depth)?;
                 Value::Bytes(array.as_slice().into())
             }
             StoreValueKind::BigInt => {
                 let ptr: AscPtr<AscBigInt> = AscPtr::from(payload);
-                let array: Vec<u8> = heap.asc_get(ptr);
-                Value::BigInt(store::scalar::BigInt::from_signed_bytes_le(&array))
+                let array: Vec<u8> = asc_get(heap, ptr, gas, depth)?;
+                Value::BigInt(store::scalar::BigInt::from_signed_bytes_le(&array)?)
             }
         })
     }
 }
 
 impl ToAscObj<AscEnum<StoreValueKind>> for store::Value {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEnum<StoreValueKind> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscEnum<StoreValueKind>, HostExportError> {
         use self::store::Value;
 
         let payload = match self {
-            Value::String(string) => heap.asc_new(string.as_str()).into(),
+            Value::String(string) => asc_new(heap, string.as_str(), gas)?.into(),
             Value::Int(n) => EnumPayload::from(*n),
-            Value::BigDecimal(n) => heap.asc_new(n).into(),
+            Value::Int8(n) => EnumPayload::from(*n),
+            Value::BigDecimal(n) => asc_new(heap, n, gas)?.into(),
             Value::Bool(b) => EnumPayload::from(*b),
-            Value::List(array) => heap.asc_new(array.as_slice()).into(),
+            Value::List(array) => asc_new(heap, array.as_slice(), gas)?.into(),
             Value::Null => EnumPayload(0),
             Value::Bytes(bytes) => {
-                let bytes_obj: AscPtr<Uint8Array> = heap.asc_new(bytes.as_slice());
+                let bytes_obj: AscPtr<Uint8Array> = asc_new(heap, bytes.as_slice(), gas)?;
                 bytes_obj.into()
             }
             Value::BigInt(big_int) => {
-                let bytes_obj: AscPtr<Uint8Array> = heap.asc_new(&*big_int.to_signed_bytes_le());
+                let bytes_obj: AscPtr<Uint8Array> =
+                    asc_new(heap, &*big_int.to_signed_bytes_le(), gas)?;
                 bytes_obj.into()
             }
         };
 
-        AscEnum {
+        Ok(AscEnum {
             kind: StoreValueKind::get_kind(self),
             _padding: 0,
             payload,
-        }
-    }
-}
-
-impl ToAscObj<AscLogParam> for ethabi::LogParam {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscLogParam {
-        AscLogParam {
-            name: heap.asc_new(self.name.as_str()),
-            value: heap.asc_new(&self.value),
-        }
+        })
     }
 }
 
 impl ToAscObj<AscJson> for serde_json::Map<String, serde_json::Value> {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscJson {
-        AscTypedMap {
-            entries: heap.asc_new(&*self.iter().collect::<Vec<_>>()),
-        }
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscJson, HostExportError> {
+        Ok(AscTypedMap {
+            entries: asc_new(heap, &*self.iter().collect::<Vec<_>>(), gas)?,
+        })
     }
 }
 
-impl ToAscObj<AscEntity> for HashMap<String, store::Value> {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEntity {
-        AscTypedMap {
-            entries: heap.asc_new(&*self.iter().collect::<Vec<_>>()),
-        }
+// Used for serializing entities.
+impl ToAscObj<AscEntity> for Vec<(Word, store::Value)> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscEntity, HostExportError> {
+        Ok(AscTypedMap {
+            entries: asc_new(heap, self.as_slice(), gas)?,
+        })
     }
 }
 
-impl ToAscObj<AscEntity> for store::Entity {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEntity {
-        AscTypedMap {
-            entries: heap.asc_new(&*self.iter().collect::<Vec<_>>()),
-        }
+impl ToAscObj<AscEntity> for Vec<(&str, &store::Value)> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscEntity, HostExportError> {
+        Ok(AscTypedMap {
+            entries: asc_new(heap, self.as_slice(), gas)?,
+        })
+    }
+}
+
+impl ToAscObj<Array<AscPtr<AscEntity>>> for Vec<Vec<(Word, store::Value)>> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<Array<AscPtr<AscEntity>>, HostExportError> {
+        let content: Result<Vec<_>, _> = self.iter().map(|x| asc_new(heap, &x, gas)).collect();
+        let content = content?;
+        Array::new(&content, heap, gas)
     }
 }
 
 impl ToAscObj<AscEnum<JsonValueKind>> for serde_json::Value {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEnum<JsonValueKind> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscEnum<JsonValueKind>, HostExportError> {
         use serde_json::Value;
 
         let payload = match self {
             Value::Null => EnumPayload(0),
             Value::Bool(b) => EnumPayload::from(*b),
-            Value::Number(number) => heap.asc_new(&*number.to_string()).into(),
-            Value::String(string) => heap.asc_new(string.as_str()).into(),
-            Value::Array(array) => heap.asc_new(array.as_slice()).into(),
-            Value::Object(object) => heap.asc_new(object).into(),
+            Value::Number(number) => asc_new(heap, &*number.to_string(), gas)?.into(),
+            Value::String(string) => asc_new(heap, string.as_str(), gas)?.into(),
+            Value::Array(array) => asc_new(heap, array.as_slice(), gas)?.into(),
+            Value::Object(object) => asc_new(heap, object, gas)?.into(),
         };
 
-        AscEnum {
+        Ok(AscEnum {
             kind: JsonValueKind::get_kind(self),
             _padding: 0,
             payload,
-        }
+        })
     }
 }
 
-impl ToAscObj<AscEthereumBlock> for EthereumBlockData {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEthereumBlock {
-        AscEthereumBlock {
-            hash: heap.asc_new(&self.hash),
-            parent_hash: heap.asc_new(&self.parent_hash),
-            uncles_hash: heap.asc_new(&self.uncles_hash),
-            author: heap.asc_new(&self.author),
-            state_root: heap.asc_new(&self.state_root),
-            transactions_root: heap.asc_new(&self.transactions_root),
-            receipts_root: heap.asc_new(&self.receipts_root),
-            number: heap.asc_new(&BigInt::from(self.number)),
-            gas_used: heap.asc_new(&BigInt::from_unsigned_u256(&self.gas_used)),
-            gas_limit: heap.asc_new(&BigInt::from_unsigned_u256(&self.gas_limit)),
-            timestamp: heap.asc_new(&BigInt::from_unsigned_u256(&self.timestamp)),
-            difficulty: heap.asc_new(&BigInt::from_unsigned_u256(&self.difficulty)),
-            total_difficulty: heap.asc_new(&BigInt::from_unsigned_u256(&self.total_difficulty)),
-            size: self
-                .size
-                .map(|size| heap.asc_new(&BigInt::from_unsigned_u256(&size)))
-                .unwrap_or_else(|| AscPtr::null()),
-        }
-    }
-}
-
-impl ToAscObj<AscEthereumTransaction> for EthereumTransactionData {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEthereumTransaction {
-        AscEthereumTransaction {
-            hash: heap.asc_new(&self.hash),
-            index: heap.asc_new(&BigInt::from(self.index)),
-            from: heap.asc_new(&self.from),
-            to: self
-                .to
-                .map(|to| heap.asc_new(&to))
-                .unwrap_or_else(|| AscPtr::null()),
-            value: heap.asc_new(&BigInt::from_unsigned_u256(&self.value)),
-            gas_used: heap.asc_new(&BigInt::from_unsigned_u256(&self.gas_used)),
-            gas_price: heap.asc_new(&BigInt::from_unsigned_u256(&self.gas_price)),
-        }
-    }
-}
-
-impl ToAscObj<AscEthereumTransaction_0_0_2> for EthereumTransactionData {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEthereumTransaction_0_0_2 {
-        AscEthereumTransaction_0_0_2 {
-            hash: heap.asc_new(&self.hash),
-            index: heap.asc_new(&BigInt::from(self.index)),
-            from: heap.asc_new(&self.from),
-            to: self
-                .to
-                .map(|to| heap.asc_new(&to))
-                .unwrap_or_else(|| AscPtr::null()),
-            value: heap.asc_new(&BigInt::from_unsigned_u256(&self.value)),
-            gas_used: heap.asc_new(&BigInt::from_unsigned_u256(&self.gas_used)),
-            gas_price: heap.asc_new(&BigInt::from_unsigned_u256(&self.gas_price)),
-            input: heap.asc_new(&*self.input.0),
-        }
-    }
-}
-
-impl<T: AscType> ToAscObj<AscEthereumEvent<T>> for EthereumEventData
-where
-    EthereumTransactionData: ToAscObj<T>,
-{
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEthereumEvent<T> {
-        AscEthereumEvent {
-            address: heap.asc_new(&self.address),
-            log_index: heap.asc_new(&BigInt::from_unsigned_u256(&self.log_index)),
-            transaction_log_index: heap
-                .asc_new(&BigInt::from_unsigned_u256(&self.transaction_log_index)),
-            log_type: self
-                .log_type
-                .clone()
-                .map(|log_type| heap.asc_new(&log_type))
-                .unwrap_or_else(|| AscPtr::null()),
-            block: heap.asc_new(&self.block),
-            transaction: heap.asc_new::<T, EthereumTransactionData>(&self.transaction),
-            params: heap.asc_new(self.params.as_slice()),
-        }
-    }
-}
-
-impl ToAscObj<AscEthereumCall> for EthereumCallData {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEthereumCall {
-        AscEthereumCall {
-            address: heap.asc_new(&self.to),
-            block: heap.asc_new(&self.block),
-            transaction: heap.asc_new(&self.transaction),
-            inputs: heap.asc_new(self.inputs.as_slice()),
-            outputs: heap.asc_new(self.outputs.as_slice()),
-        }
-    }
-}
-
-impl ToAscObj<AscEthereumCall_0_0_3> for EthereumCallData {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscEthereumCall_0_0_3 {
-        AscEthereumCall_0_0_3 {
-            to: heap.asc_new(&self.to),
-            from: heap.asc_new(&self.from),
-            block: heap.asc_new(&self.block),
-            transaction: heap.asc_new(&self.transaction),
-            inputs: heap.asc_new(self.inputs.as_slice()),
-            outputs: heap.asc_new(self.outputs.as_slice()),
-        }
-    }
-}
-
-impl FromAscObj<AscUnresolvedContractCall> for UnresolvedContractCall {
-    fn from_asc_obj<H: AscHeap>(asc_call: AscUnresolvedContractCall, heap: &H) -> Self {
-        UnresolvedContractCall {
-            contract_name: heap.asc_get(asc_call.contract_name),
-            contract_address: heap.asc_get(asc_call.contract_address),
-            function_name: heap.asc_get(asc_call.function_name),
-            function_signature: None,
-            function_args: heap.asc_get(asc_call.function_args),
-        }
-    }
-}
-
-impl FromAscObj<AscUnresolvedContractCall_0_0_4> for UnresolvedContractCall {
-    fn from_asc_obj<H: AscHeap>(asc_call: AscUnresolvedContractCall_0_0_4, heap: &H) -> Self {
-        UnresolvedContractCall {
-            contract_name: heap.asc_get(asc_call.contract_name),
-            contract_address: heap.asc_get(asc_call.contract_address),
-            function_name: heap.asc_get(asc_call.function_name),
-            function_signature: Some(heap.asc_get(asc_call.function_signature)),
-            function_args: heap.asc_get(asc_call.function_args),
-        }
-    }
-}
-
-impl From<i32> for LogLevel {
-    fn from(i: i32) -> Self {
+impl From<u32> for LogLevel {
+    fn from(i: u32) -> Self {
         match i {
             0 => LogLevel::Critical,
             1 => LogLevel::Error,
@@ -442,43 +404,43 @@ impl From<i32> for LogLevel {
     }
 }
 
-impl ToAscObj<bool> for bool {
-    fn to_asc_obj<H: AscHeap>(&self, _heap: &mut H) -> bool {
-        *self
+impl<T: AscValue> ToAscObj<AscWrapped<T>> for AscWrapped<T> {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        _heap: &mut H,
+        _gas: &GasCounter,
+    ) -> Result<AscWrapped<T>, HostExportError> {
+        Ok(*self)
     }
 }
 
-impl<T: AscType> ToAscObj<AscWrapped<T>> for AscWrapped<T> {
-    fn to_asc_obj<H: AscHeap>(&self, _heap: &mut H) -> AscWrapped<T> {
-        *self
-    }
-}
-
-impl<V, E, VAsc, EAsc> ToAscObj<AscResult<VAsc, EAsc>> for Result<V, E>
+impl<V, VAsc> ToAscObj<AscResult<AscPtr<VAsc>, bool>> for Result<V, bool>
 where
     V: ToAscObj<VAsc>,
-    E: ToAscObj<EAsc>,
-    VAsc: AscType,
-    EAsc: AscType,
+    VAsc: AscType + AscIndexId,
+    AscWrapped<AscPtr<VAsc>>: AscIndexId,
 {
-    fn to_asc_obj<H: AscHeap>(&self, heap: &mut H) -> AscResult<VAsc, EAsc> {
-        match self {
+    fn to_asc_obj<H: AscHeap + ?Sized>(
+        &self,
+        heap: &mut H,
+        gas: &GasCounter,
+    ) -> Result<AscResult<AscPtr<VAsc>, bool>, HostExportError> {
+        Ok(match self {
             Ok(value) => AscResult {
                 value: {
-                    let inner = heap.asc_new(value);
+                    let inner = asc_new(heap, value, gas)?;
                     let wrapped = AscWrapped { inner };
-                    heap.asc_new(&wrapped)
+                    asc_new(heap, &wrapped, gas)?
                 },
                 error: AscPtr::null(),
             },
-            Err(e) => AscResult {
+            Err(_) => AscResult {
                 value: AscPtr::null(),
                 error: {
-                    let inner = heap.asc_new(e);
-                    let wrapped = AscWrapped { inner };
-                    heap.asc_new(&wrapped)
+                    let wrapped = AscWrapped { inner: true };
+                    asc_new(heap, &wrapped, gas)?
                 },
             },
-        }
+        })
     }
 }

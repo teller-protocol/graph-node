@@ -41,10 +41,6 @@ pub mod subgraph;
 /// Components dealing with Ethereum.
 pub mod ethereum;
 
-pub mod arweave;
-
-pub mod three_box;
-
 /// Components dealing with processing GraphQL.
 pub mod graphql;
 
@@ -56,42 +52,13 @@ pub mod store;
 
 pub mod link_resolver;
 
+pub mod trigger_processor;
+
 /// Components dealing with collecting metrics
 pub mod metrics;
 
-/// Plug the outputs of `output` of type `E` to the matching inputs in `input`.
-/// This is a lazy operation, nothing will be sent until you spawn the returned
-/// future. Returns `Some` in the first call and `None` on any further calls.
-///
-/// See `Stream::forward` for details.
-pub fn forward<E: Send, O: EventProducer<E>, I: EventConsumer<E>>(
-    output: &mut O,
-    input: &I,
-) -> Option<impl Future<Item = (), Error = ()> + Send> {
-    output
-        .take_event_stream()
-        .map(|stream| stream.forward(input.event_sink()).map(|_| ()))
-}
-
-/// Like `forward`, but forwards outputs to two components by cloning the
-/// events. If you need more, create more versions of this or manipulate
-/// `event_sink()` and `take_event_stream()` directly.
-pub fn forward2<
-    E: Clone + Send,
-    O: EventProducer<E>,
-    I1: EventConsumer<E>,
-    I2: EventConsumer<E>,
->(
-    output: &mut O,
-    input1: &I1,
-    input2: &I2,
-) -> Option<impl Future<Item = (), Error = ()> + Send> {
-    output.take_event_stream().map(|stream| {
-        stream
-            .forward(input1.event_sink().fanout(input2.event_sink()))
-            .map(|_| ())
-    })
-}
+/// Components dealing with versioning
+pub mod versions;
 
 /// A component that receives events of type `T`.
 pub trait EventConsumer<E> {
@@ -110,3 +77,5 @@ pub trait EventProducer<E> {
     /// Avoid calling directly, prefer helpers such as `forward`.
     fn take_event_stream(&mut self) -> Option<Box<dyn Stream<Item = E, Error = ()> + Send>>;
 }
+
+pub mod transaction_receipt;

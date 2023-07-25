@@ -1,11 +1,13 @@
-mod request;
+mod auth;
+mod explorer;
 mod resolver;
-mod response;
 mod schema;
 mod server;
 mod service;
 
-pub use self::request::IndexNodeRequest;
-pub use self::response::IndexNodeResponse;
+pub use self::auth::PoiProtection;
 pub use self::server::IndexNodeServer;
 pub use self::service::{IndexNodeService, IndexNodeServiceResponse};
+
+#[cfg(debug_assertions)]
+pub use self::resolver::IndexNodeResolver;

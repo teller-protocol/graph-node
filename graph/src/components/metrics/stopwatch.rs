@@ -1,5 +1,4 @@
 use crate::prelude::*;
-use std::collections::HashMap;
 use std::sync::{atomic::AtomicBool, atomic::Ordering, Mutex};
 use std::time::Instant;
 
@@ -16,8 +15,7 @@ impl Section {
 
 impl Drop for Section {
     fn drop(&mut self) {
-        self.stopwatch
-            .end_section(std::mem::replace(&mut self.id, String::new()))
+        self.stopwatch.end_section(std::mem::take(&mut self.id))
     }
 }
 
@@ -40,24 +38,32 @@ pub struct StopwatchMetrics {
     inner: Arc<Mutex<StopwatchInner>>,
 }
 
+impl CheapClone for StopwatchMetrics {}
+
 impl StopwatchMetrics {
     pub fn new(
         logger: Logger,
-        subgraph_id: SubgraphDeploymentId,
-        registry: Arc<dyn MetricsRegistry>,
+        subgraph_id: DeploymentHash,
+        stage: &str,
+        registry: Arc<MetricsRegistry>,
     ) -> Self {
+        let stage = stage.to_owned();
         let mut inner = StopwatchInner {
-            total_counter: *registry
-                .new_counter(
-                    format!("{}_sync_total_secs", subgraph_id),
-                    format!("total time spent syncing"),
-                    HashMap::new(),
+            counter: registry
+                .global_deployment_counter_vec(
+                    "deployment_sync_secs",
+                    "total time spent syncing",
+                    subgraph_id.as_str(),
+                    &["section", "stage"],
                 )
-                .expect("failed to register total_secs prometheus counter"),
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "failed to register subgraph_sync_total_secs prometheus counter for {}",
+                        subgraph_id
+                    )
+                }),
             logger,
-            subgraph_id,
-            registry,
-            counters: HashMap::new(),
+            stage,
             section_stack: Vec::new(),
             timer: Instant::now(),
         };
@@ -101,49 +107,34 @@ impl StopwatchMetrics {
 /// that there is no double counting, time spent in child sections doesn't count for the parent.
 struct StopwatchInner {
     logger: Logger,
-    subgraph_id: SubgraphDeploymentId,
-    registry: Arc<dyn MetricsRegistry>,
 
-    // Counter for the total time the subgraph spent syncing.
-    total_counter: Counter,
-
-    // Counts the seconds spent in each section of the indexing code.
-    counters: HashMap<String, Counter>,
+    // Counter for the total time the subgraph spent syncing in various sections.
+    counter: CounterVec,
 
     // The top section (last item) is the one that's currently executing.
     section_stack: Vec<String>,
 
     // The timer is reset whenever a section starts or ends.
     timer: Instant,
+
+    // The processing stage the metrics belong to; for pipelined uses, the
+    // pipeline stage
+    stage: String,
 }
 
 impl StopwatchInner {
     fn record_and_reset(&mut self) {
         if let Some(section) = self.section_stack.last() {
-            // Get or create the counter.
-            let counter = if let Some(counter) = self.counters.get(section) {
-                counter.clone()
-            } else {
-                let name = format!("{}_{}_secs", self.subgraph_id, section);
-                let help = format!("section {}", section);
-                match self.registry.new_counter(name, help, HashMap::new()) {
-                    Ok(counter) => {
-                        self.counters.insert(section.clone(), (*counter).clone());
-                        *counter
-                    }
-                    Err(e) => {
-                        error!(self.logger, "failed to register counter";
-                                            "id" => section,
-                                            "error" => e.to_string());
-                        return;
-                    }
-                }
-            };
-
             // Register the current timer.
             let elapsed = self.timer.elapsed().as_secs_f64();
-            self.total_counter.inc_by(elapsed);
-            counter.inc_by(elapsed);
+            self.counter
+                .get_metric_with_label_values(&[section, &self.stage])
+                .map(|counter| counter.inc_by(elapsed))
+                .unwrap_or_else(|e| {
+                    error!(self.logger, "failed to find counter for section";
+                    "id" => section,
+                    "error" => e.to_string());
+                });
         }
 
         // Reset the timer.

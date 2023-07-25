@@ -1,404 +1,174 @@
-use std::collections::HashMap;
-use std::str::FromStr;
-use std::time::{Duration, Instant};
+use std::cmp::PartialEq;
+use std::time::Instant;
 
 use async_trait::async_trait;
-use ethabi::{LogParam, RawLog};
 use futures::sync::mpsc::Sender;
 use futures03::channel::oneshot::channel;
-use semver::{Version, VersionReq};
-use slog::{o, OwnedKV};
-use strum::AsStaticRef as _;
-use tiny_keccak::keccak256;
 
-use graph::components::arweave::ArweaveAdapter;
-use graph::components::ethereum::*;
-use graph::components::store::Store;
-use graph::components::subgraph::SharedProofOfIndexing;
-use graph::components::three_box::ThreeBoxAdapter;
-use graph::data::subgraph::{Mapping, Source};
+use graph::blockchain::{Blockchain, HostFn, RuntimeAdapter};
+use graph::components::store::{EnsLookup, SubgraphFork};
+use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
+use graph::data_source::{
+    DataSource, DataSourceTemplate, MappingTrigger, TriggerData, TriggerWithHandler,
+};
 use graph::prelude::{
     RuntimeHost as RuntimeHostTrait, RuntimeHostBuilder as RuntimeHostBuilderTrait, *,
 };
-use graph::util;
-use web3::types::{Log, Transaction};
 
-use crate::host_exports::HostExports;
-use crate::mapping::{MappingContext, MappingRequest, MappingTrigger};
+use crate::mapping::{MappingContext, MappingRequest};
+use crate::module::ToAscPtr;
+use crate::{host_exports::HostExports, module::ExperimentalFeatures};
+use graph::runtime::gas::Gas;
 
-pub(crate) const TIMEOUT_ENV_VAR: &str = "GRAPH_MAPPING_HANDLER_TIMEOUT";
-
-struct RuntimeHostConfig {
-    subgraph_id: SubgraphDeploymentId,
-    mapping: Mapping,
-    data_source_network: String,
-    data_source_name: String,
-    data_source_context: Option<DataSourceContext>,
-    contract: Source,
-    templates: Arc<Vec<DataSourceTemplate>>,
-}
-
-pub struct RuntimeHostBuilder<S> {
-    ethereum_adapters: HashMap<String, Arc<dyn EthereumAdapter>>,
+pub struct RuntimeHostBuilder<C: Blockchain> {
+    runtime_adapter: Arc<dyn RuntimeAdapter<C>>,
     link_resolver: Arc<dyn LinkResolver>,
-    stores: HashMap<String, Arc<S>>,
-    arweave_adapter: Arc<dyn ArweaveAdapter>,
-    three_box_adapter: Arc<dyn ThreeBoxAdapter>,
+    ens_lookup: Arc<dyn EnsLookup>,
 }
 
-impl<S> Clone for RuntimeHostBuilder<S>
-where
-    S: Store,
-{
+impl<C: Blockchain> Clone for RuntimeHostBuilder<C> {
     fn clone(&self) -> Self {
         RuntimeHostBuilder {
-            ethereum_adapters: self.ethereum_adapters.clone(),
-            link_resolver: self.link_resolver.clone(),
-            stores: self.stores.clone(),
-            arweave_adapter: self.arweave_adapter.cheap_clone(),
-            three_box_adapter: self.three_box_adapter.cheap_clone(),
+            runtime_adapter: self.runtime_adapter.cheap_clone(),
+            link_resolver: self.link_resolver.cheap_clone(),
+            ens_lookup: self.ens_lookup.cheap_clone(),
         }
     }
 }
 
-impl<S> RuntimeHostBuilder<S>
-where
-    S: Store + SubgraphDeploymentStore + EthereumCallCache,
-{
+impl<C: Blockchain> RuntimeHostBuilder<C> {
     pub fn new(
-        ethereum_adapters: HashMap<String, Arc<dyn EthereumAdapter>>,
+        runtime_adapter: Arc<dyn RuntimeAdapter<C>>,
         link_resolver: Arc<dyn LinkResolver>,
-        stores: HashMap<String, Arc<S>>,
-        arweave_adapter: Arc<dyn ArweaveAdapter>,
-        three_box_adapter: Arc<dyn ThreeBoxAdapter>,
+        ens_lookup: Arc<dyn EnsLookup>,
     ) -> Self {
         RuntimeHostBuilder {
-            ethereum_adapters,
+            runtime_adapter,
             link_resolver,
-            stores,
-            arweave_adapter,
-            three_box_adapter,
+            ens_lookup,
         }
     }
 }
 
-impl<S> RuntimeHostBuilderTrait for RuntimeHostBuilder<S>
+impl<C: Blockchain> RuntimeHostBuilderTrait<C> for RuntimeHostBuilder<C>
 where
-    S: Send + Sync + 'static + Store + SubgraphDeploymentStore + EthereumCallCache,
+    <C as Blockchain>::MappingTrigger: ToAscPtr,
 {
-    type Host = RuntimeHost;
-    type Req = MappingRequest;
+    type Host = RuntimeHost<C>;
+    type Req = MappingRequest<C>;
 
     fn spawn_mapping(
         raw_module: &[u8],
         logger: Logger,
-        subgraph_id: SubgraphDeploymentId,
+        subgraph_id: DeploymentHash,
         metrics: Arc<HostMetrics>,
     ) -> Result<Sender<Self::Req>, Error> {
+        let experimental_features = ExperimentalFeatures {
+            allow_non_deterministic_ipfs: ENV_VARS.mappings.allow_non_deterministic_ipfs,
+        };
         crate::mapping::spawn_module(
             raw_module,
             logger,
             subgraph_id,
             metrics,
             tokio::runtime::Handle::current(),
+            ENV_VARS.mappings.timeout,
+            experimental_features,
         )
     }
 
     fn build(
         &self,
         network_name: String,
-        subgraph_id: SubgraphDeploymentId,
-        data_source: DataSource,
-        top_level_templates: Arc<Vec<DataSourceTemplate>>,
-        mapping_request_sender: Sender<MappingRequest>,
+        subgraph_id: DeploymentHash,
+        data_source: DataSource<C>,
+        templates: Arc<Vec<DataSourceTemplate<C>>>,
+        mapping_request_sender: Sender<MappingRequest<C>>,
         metrics: Arc<HostMetrics>,
     ) -> Result<Self::Host, Error> {
-        let store = self.stores.get(&network_name).ok_or_else(|| {
-            format_err!(
-                "No store found that matches subgraph network: \"{}\"",
-                &network_name
-            )
-        })?;
-
-        let ethereum_adapter = self.ethereum_adapters.get(&network_name).ok_or_else(|| {
-            format_err!(
-                "No Ethereum adapter found that matches subgraph network: \"{}\"",
-                &network_name
-            )
-        })?;
-
-        // Detect whether the subgraph uses templates in data sources, which are
-        // deprecated, or the top-level templates field.
-        let templates = match top_level_templates.is_empty() {
-            false => top_level_templates,
-            true => Arc::new(data_source.templates),
-        };
-
         RuntimeHost::new(
-            ethereum_adapter.clone(),
+            self.runtime_adapter.cheap_clone(),
             self.link_resolver.clone(),
-            store.clone(),
-            store.clone(),
-            RuntimeHostConfig {
-                subgraph_id,
-                mapping: data_source.mapping,
-                data_source_network: network_name,
-                data_source_name: data_source.name,
-                data_source_context: data_source.context,
-                contract: data_source.source,
-                templates,
-            },
+            network_name,
+            subgraph_id,
+            data_source,
+            templates,
             mapping_request_sender,
             metrics,
-            self.arweave_adapter.cheap_clone(),
-            self.three_box_adapter.cheap_clone(),
+            self.ens_lookup.cheap_clone(),
         )
     }
 }
 
-#[derive(Debug)]
-pub struct RuntimeHost {
-    data_source_name: String,
-    data_source_contract: Source,
-    data_source_contract_abi: MappingABI,
-    data_source_event_handlers: Vec<MappingEventHandler>,
-    data_source_call_handlers: Vec<MappingCallHandler>,
-    data_source_block_handlers: Vec<MappingBlockHandler>,
-    mapping_request_sender: Sender<MappingRequest>,
-    host_exports: Arc<HostExports>,
+pub struct RuntimeHost<C: Blockchain> {
+    host_fns: Arc<Vec<HostFn>>,
+    data_source: DataSource<C>,
+    mapping_request_sender: Sender<MappingRequest<C>>,
+    host_exports: Arc<HostExports<C>>,
     metrics: Arc<HostMetrics>,
 }
 
-impl RuntimeHost {
+impl<C> RuntimeHost<C>
+where
+    C: Blockchain,
+{
     fn new(
-        ethereum_adapter: Arc<dyn EthereumAdapter>,
+        runtime_adapter: Arc<dyn RuntimeAdapter<C>>,
         link_resolver: Arc<dyn LinkResolver>,
-        store: Arc<dyn crate::RuntimeStore>,
-        call_cache: Arc<dyn EthereumCallCache>,
-        config: RuntimeHostConfig,
-        mapping_request_sender: Sender<MappingRequest>,
+        network_name: String,
+        subgraph_id: DeploymentHash,
+        data_source: DataSource<C>,
+        templates: Arc<Vec<DataSourceTemplate<C>>>,
+        mapping_request_sender: Sender<MappingRequest<C>>,
         metrics: Arc<HostMetrics>,
-        arweave_adapter: Arc<dyn ArweaveAdapter>,
-        three_box_adapter: Arc<dyn ThreeBoxAdapter>,
+        ens_lookup: Arc<dyn EnsLookup>,
     ) -> Result<Self, Error> {
-        let api_version = Version::parse(&config.mapping.api_version)?;
-        if !VersionReq::parse("<= 0.0.4").unwrap().matches(&api_version) {
-            return Err(format_err!(
-                "This Graph Node only supports mapping API versions <= 0.0.4, but subgraph `{}` uses `{}`",
-                config.subgraph_id,
-                api_version
-            ));
-        }
-
-        let data_source_contract_abi = config
-            .mapping
-            .abis
-            .iter()
-            .find(|abi| abi.name == config.contract.abi)
-            .ok_or_else(|| {
-                format_err!(
-                    "No ABI entry found for the main contract of data source \"{}\": {}",
-                    &config.data_source_name,
-                    config.contract.abi,
-                )
-            })?
-            .clone();
-
-        let data_source_name = config.data_source_name;
-        let timeout = std::env::var(TIMEOUT_ENV_VAR)
-            .ok()
-            .and_then(|s| u64::from_str(&s).ok())
-            .map(Duration::from_secs);
-
         // Create new instance of externally hosted functions invoker. The `Arc` is simply to avoid
         // implementing `Clone` for `HostExports`.
         let host_exports = Arc::new(HostExports::new(
-            config.subgraph_id.clone(),
-            api_version,
-            data_source_name.clone(),
-            config.contract.address.clone(),
-            config.data_source_network,
-            config.data_source_context,
-            config.templates,
-            config.mapping.abis,
-            ethereum_adapter,
+            subgraph_id,
+            &data_source,
+            network_name,
+            templates,
             link_resolver,
-            store,
-            call_cache,
-            timeout,
-            arweave_adapter,
-            three_box_adapter,
+            ens_lookup,
         ));
 
+        let host_fns = data_source
+            .as_onchain()
+            .map(|ds| runtime_adapter.host_fns(ds))
+            .transpose()?
+            .unwrap_or_default();
+
         Ok(RuntimeHost {
-            data_source_name,
-            data_source_contract: config.contract,
-            data_source_contract_abi,
-            data_source_event_handlers: config.mapping.event_handlers,
-            data_source_call_handlers: config.mapping.call_handlers,
-            data_source_block_handlers: config.mapping.block_handlers,
+            host_fns: Arc::new(host_fns),
+            data_source,
             mapping_request_sender,
             host_exports,
             metrics,
         })
     }
 
-    fn matches_call_address(&self, call: &EthereumCall) -> bool {
-        // The runtime host matches the contract address of the `EthereumCall`
-        // if the data source contains the same contract address or
-        // if the data source doesn't have a contract address at all
-        self.data_source_contract
-            .address
-            .map_or(true, |addr| addr == call.to)
-    }
-
-    fn matches_call_function(&self, call: &EthereumCall) -> bool {
-        let target_method_id = &call.input.0[..4];
-        self.data_source_call_handlers.iter().any(|handler| {
-            let fhash = keccak256(handler.function.as_bytes());
-            let actual_method_id = [fhash[0], fhash[1], fhash[2], fhash[3]];
-            target_method_id == actual_method_id
-        })
-    }
-
-    fn matches_log_address(&self, log: &Log) -> bool {
-        // The runtime host matches the contract address of the `Log`
-        // if the data source contains the same contract address or
-        // if the data source doesn't have a contract address at all
-        self.data_source_contract
-            .address
-            .map_or(true, |addr| addr == log.address)
-    }
-
-    fn matches_log_signature(&self, log: &Log) -> bool {
-        let topic0 = match log.topics.iter().next() {
-            Some(topic0) => topic0,
-            None => return false,
-        };
-
-        self.data_source_event_handlers
-            .iter()
-            .any(|handler| *topic0 == handler.topic0())
-    }
-
-    fn matches_block_trigger(&self, block_trigger_type: &EthereumBlockTriggerType) -> bool {
-        let source_address_matches = match block_trigger_type {
-            EthereumBlockTriggerType::WithCallTo(address) => {
-                self.data_source_contract
-                    .address
-                    // Do not match if this datasource has no address
-                    .map_or(false, |addr| addr == *address)
-            }
-            EthereumBlockTriggerType::Every => true,
-        };
-        source_address_matches && self.handler_for_block(block_trigger_type).is_ok()
-    }
-
-    fn handlers_for_log(&self, log: &Arc<Log>) -> Result<Vec<MappingEventHandler>, Error> {
-        // Get signature from the log
-        let topic0 = match log.topics.iter().next() {
-            Some(topic0) => topic0,
-            None => return Err(format_err!("Ethereum event has no topics")),
-        };
-
-        let handlers = self
-            .data_source_event_handlers
-            .iter()
-            .filter(|handler| *topic0 == handler.topic0())
-            .cloned()
-            .collect::<Vec<_>>();
-
-        if !handlers.is_empty() {
-            Ok(handlers)
-        } else {
-            Err(format_err!(
-                "No event handler found for event in data source \"{}\"",
-                self.data_source_name,
-            ))
-        }
-    }
-
-    fn handler_for_call(&self, call: &EthereumCall) -> Result<MappingCallHandler, Error> {
-        // First four bytes of the input for the call are the first four
-        // bytes of hash of the function signature
-        if call.input.0.len() < 4 {
-            return Err(format_err!(
-                "Ethereum call has input with less than 4 bytes"
-            ));
-        }
-
-        let target_method_id = &call.input.0[..4];
-
-        self.data_source_call_handlers
-            .iter()
-            .find(move |handler| {
-                let fhash = keccak256(handler.function.as_bytes());
-                let actual_method_id = [fhash[0], fhash[1], fhash[2], fhash[3]];
-                target_method_id == actual_method_id
-            })
-            .cloned()
-            .ok_or_else(|| {
-                format_err!(
-                    "No call handler found for call in data source \"{}\"",
-                    self.data_source_name,
-                )
-            })
-    }
-
-    fn handler_for_block(
-        &self,
-        trigger_type: &EthereumBlockTriggerType,
-    ) -> Result<MappingBlockHandler, Error> {
-        match trigger_type {
-            EthereumBlockTriggerType::Every => self
-                .data_source_block_handlers
-                .iter()
-                .find(move |handler| handler.filter == None)
-                .cloned()
-                .ok_or_else(|| {
-                    format_err!(
-                        "No block handler for `Every` block trigger \
-                         type found in data source \"{}\"",
-                        self.data_source_name,
-                    )
-                }),
-            EthereumBlockTriggerType::WithCallTo(_address) => self
-                .data_source_block_handlers
-                .iter()
-                .find(move |handler| {
-                    handler.filter.is_some()
-                        && handler.filter.clone().unwrap() == BlockHandlerFilter::Call
-                })
-                .cloned()
-                .ok_or_else(|| {
-                    format_err!(
-                        "No block handler for `WithCallTo` block trigger \
-                         type found in data source \"{}\"",
-                        self.data_source_name,
-                    )
-                }),
-        }
-    }
-
     /// Sends a MappingRequest to the thread which owns the host,
     /// and awaits the result.
-    async fn send_mapping_request<T: slog::SendSyncRefUnwindSafeKV>(
+    async fn send_mapping_request(
         &self,
         logger: &Logger,
-        extra: OwnedKV<T>,
-        state: BlockState,
-        handler: &str,
-        trigger: MappingTrigger,
-        block: &Arc<LightEthereumBlock>,
+        state: BlockState<C>,
+        trigger: TriggerWithHandler<MappingTrigger<C>>,
+        block_ptr: BlockPtr,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, failure::Error> {
-        let trigger_type = trigger.as_static();
-        debug!(
-            logger, "Start processing Ethereum trigger";
-            &extra,
-            "trigger_type" => trigger_type,
-            "handler" => handler,
-            "data_source" => &self.data_source_name,
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
+        instrument: bool,
+    ) -> Result<BlockState<C>, MappingError> {
+        let handler = trigger.handler_name().to_string();
+
+        let extras = trigger.logging_extras();
+        trace!(
+            logger, "Start processing trigger";
+            &extras,
+            "handler" => &handler,
+            "data_source" => &self.data_source.name(),
         );
 
         let (result_sender, result_receiver) = channel();
@@ -412,310 +182,103 @@ impl RuntimeHost {
                     logger: logger.cheap_clone(),
                     state,
                     host_exports: self.host_exports.cheap_clone(),
-                    block: block.cheap_clone(),
+                    block_ptr,
                     proof_of_indexing,
+                    host_fns: self.host_fns.cheap_clone(),
+                    debug_fork: debug_fork.cheap_clone(),
+                    mapping_logger: Logger::new(&logger, o!("component" => "UserMapping")),
+                    instrument,
                 },
                 trigger,
                 result_sender,
             })
-            .map_err(|_| format_err!("Mapping terminated before passing in trigger"))
             .compat()
-            .await?;
-
-        let (result, send_time) = result_receiver
             .await
-            .map_err(|_| format_err!("Mapping terminated before handling trigger"))?;
+            .context("Mapping terminated before passing in trigger")?;
+
+        let result = result_receiver
+            .await
+            .context("Mapping terminated before handling trigger")?;
 
         let elapsed = start_time.elapsed();
-        metrics.observe_handler_execution_time(elapsed.as_secs_f64(), handler);
+        metrics.observe_handler_execution_time(elapsed.as_secs_f64(), &handler);
 
+        // If there is an error, "gas_used" is incorrectly reported as 0.
+        let gas_used = result.as_ref().map(|(_, gas)| gas).unwrap_or(&Gas::ZERO);
         info!(
-            logger, "Done processing Ethereum trigger";
-            extra,
-
-            "trigger_type" => trigger_type,
+            logger, "Done processing trigger";
+            &extras,
             "total_ms" => elapsed.as_millis(),
             "handler" => handler,
-
-            // How much time the result spent in the channel,
-            // waiting in the tokio threadpool queue. Anything
-            // larger than 0 is bad here. The `.wait()` is instant.
-            "waiting_ms" => send_time
-                .wait()
-                .unwrap()
-                .elapsed()
-                .as_millis(),
+            "data_source" => &self.data_source.name(),
+            "gas_used" => gas_used.to_string(),
         );
 
-        result
+        // Discard the gas value
+        result.map(|(block_state, _)| block_state)
     }
 }
 
 #[async_trait]
-impl RuntimeHostTrait for RuntimeHost {
-    fn matches_log(&self, log: &Log) -> bool {
-        self.matches_log_address(log)
-            && self.matches_log_signature(log)
-            && self.data_source_contract.start_block <= log.block_number.unwrap().as_u64()
+impl<C: Blockchain> RuntimeHostTrait<C> for RuntimeHost<C> {
+    fn data_source(&self) -> &DataSource<C> {
+        &self.data_source
     }
 
-    fn matches_call(&self, call: &EthereumCall) -> bool {
-        self.matches_call_address(call)
-            && self.matches_call_function(call)
-            && self.data_source_contract.start_block <= call.block_number
-    }
-
-    fn matches_block(
+    fn match_and_decode(
         &self,
-        block_trigger_type: &EthereumBlockTriggerType,
-        block_number: u64,
-    ) -> bool {
-        self.matches_block_trigger(block_trigger_type)
-            && self.data_source_contract.start_block <= block_number
+        trigger: &TriggerData<C>,
+        block: &Arc<C::Block>,
+        logger: &Logger,
+    ) -> Result<Option<TriggerWithHandler<MappingTrigger<C>>>, Error> {
+        self.data_source.match_and_decode(trigger, block, logger)
     }
 
-    async fn process_call(
+    async fn process_mapping_trigger(
         &self,
         logger: &Logger,
-        block: &Arc<LightEthereumBlock>,
-        transaction: &Arc<Transaction>,
-        call: &Arc<EthereumCall>,
-        state: BlockState,
+        block_ptr: BlockPtr,
+        trigger: TriggerWithHandler<MappingTrigger<C>>,
+        state: BlockState<C>,
         proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, Error> {
-        // Identify the call handler for this call
-        let call_handler = self.handler_for_call(&call)?;
-
-        // Identify the function ABI in the contract
-        let function_abi = util::ethereum::contract_function_with_signature(
-            &self.data_source_contract_abi.contract,
-            call_handler.function.as_str(),
-        )
-        .ok_or_else(|| {
-            format_err!(
-                "Function with the signature \"{}\" not found in \
-                    contract \"{}\" of data source \"{}\"",
-                call_handler.function,
-                self.data_source_contract_abi.name,
-                self.data_source_name
-            )
-        })?;
-
-        // Parse the inputs
-        //
-        // Take the input for the call, chop off the first 4 bytes, then call
-        // `function.decode_output` to get a vector of `Token`s. Match the `Token`s
-        // with the `Param`s in `function.inputs` to create a `Vec<LogParam>`.
-        let tokens = function_abi
-            .decode_input(&call.input.0[4..])
-            .map_err(|err| {
-                format_err!(
-                    "Generating function inputs for an Ethereum call failed = {}",
-                    err,
-                )
-            })?;
-
-        if tokens.len() != function_abi.inputs.len() {
-            return Err(format_err!(
-                "Number of arguments in call does not match \
-                    number of inputs in function signature."
-            ));
-        }
-
-        let inputs = tokens
-            .into_iter()
-            .enumerate()
-            .map(|(i, token)| LogParam {
-                name: function_abi.inputs[i].name.clone(),
-                value: token,
-            })
-            .collect::<Vec<_>>();
-
-        // Parse the outputs
-        //
-        // Take the output for the call, then call `function.decode_output` to
-        // get a vector of `Token`s. Match the `Token`s with the `Param`s in
-        // `function.outputs` to create a `Vec<LogParam>`.
-        let tokens = function_abi.decode_output(&call.output.0).map_err(|err| {
-            format_err!(
-                "Generating function outputs for an Ethereum call failed = {}",
-                err,
-            )
-        })?;
-
-        if tokens.len() != function_abi.outputs.len() {
-            return Err(format_err!(
-                "Number of parameters in the call output does not match \
-                        number of outputs in the function signature."
-            ));
-        }
-
-        let outputs = tokens
-            .into_iter()
-            .enumerate()
-            .map(|(i, token)| LogParam {
-                name: function_abi.outputs[i].name.clone(),
-                value: token,
-            })
-            .collect::<Vec<_>>();
-
+        debug_fork: &Option<Arc<dyn SubgraphFork>>,
+        instrument: bool,
+    ) -> Result<BlockState<C>, MappingError> {
         self.send_mapping_request(
             logger,
-            o! {
-                "function" => &call_handler.function,
-                "to" => format!("{}", &call.to),
-            },
             state,
-            &call_handler.handler,
-            MappingTrigger::Call {
-                transaction: transaction.cheap_clone(),
-                call: call.cheap_clone(),
-                inputs,
-                outputs,
-                handler: call_handler.clone(),
-            },
-            block,
+            trigger,
+            block_ptr,
             proof_of_indexing,
+            debug_fork,
+            instrument,
         )
         .await
     }
 
-    async fn process_block(
-        &self,
-        logger: &Logger,
-        block: &Arc<LightEthereumBlock>,
-        trigger_type: &EthereumBlockTriggerType,
-        state: BlockState,
-        proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, Error> {
-        let block_handler = self.handler_for_block(trigger_type)?;
-        self.send_mapping_request(
-            logger,
-            o! {
-                "hash" => block.hash.unwrap().to_string(),
-                "number" => &block.number.unwrap().to_string(),
-            },
-            state,
-            &block_handler.handler,
-            MappingTrigger::Block {
-                handler: block_handler.clone(),
-            },
-            block,
-            proof_of_indexing,
-        )
-        .await
+    fn creation_block_number(&self) -> Option<BlockNumber> {
+        self.data_source.creation_block()
     }
 
-    async fn process_log(
-        &self,
-        logger: &Logger,
-        block: &Arc<LightEthereumBlock>,
-        transaction: &Arc<Transaction>,
-        log: &Arc<Log>,
-        state: BlockState,
-        proof_of_indexing: SharedProofOfIndexing,
-    ) -> Result<BlockState, Error> {
-        let data_source_name = &self.data_source_name;
-        let abi_name = &self.data_source_contract_abi.name;
-        let contract = &self.data_source_contract_abi.contract;
-
-        // If there are no matching handlers, fail processing the event
-        let potential_handlers = self.handlers_for_log(&log)?;
-
-        // Map event handlers to (event handler, event ABI) pairs; fail if there are
-        // handlers that don't exist in the contract ABI
-        let valid_handlers = potential_handlers
-            .into_iter()
-            .map(|event_handler| {
-                // Identify the event ABI in the contract
-                let event_abi = util::ethereum::contract_event_with_signature(
-                    contract,
-                    event_handler.event.as_str(),
-                )
-                .ok_or_else(|| {
-                    format_err!(
-                        "Event with the signature \"{}\" not found in \
-                                contract \"{}\" of data source \"{}\"",
-                        event_handler.event,
-                        abi_name,
-                        data_source_name,
-                    )
-                })?;
-                Ok((event_handler, event_abi))
-            })
-            .collect::<Result<Vec<_>, failure::Error>>()?;
-
-        // Filter out handlers whose corresponding event ABIs cannot decode the
-        // params (this is common for overloaded events that have the same topic0
-        // but have indexed vs. non-indexed params that are encoded differently).
-        //
-        // Map (handler, event ABI) pairs to (handler, decoded params) pairs.
-        let mut matching_handlers = valid_handlers
-            .into_iter()
-            .filter_map(|(event_handler, event_abi)| {
-                event_abi
-                    .parse_log(RawLog {
-                        topics: log.topics.clone(),
-                        data: log.data.clone().0,
-                    })
-                    .map(|log| log.params)
-                    .map_err(|e| {
-                        info!(
-                            logger,
-                            "Skipping handler because the event parameters do not \
-                            match the event signature. This is typically the case \
-                            when parameters are indexed in the event but not in the \
-                            signature or the other way around";
-                            "handler" => &event_handler.handler,
-                            "event" => &event_handler.event,
-                            "error" => format!("{}", e),
-                        );
-                    })
-                    .ok()
-                    .map(|params| (event_handler, params))
-            })
-            .collect::<Vec<_>>();
-
-        if matching_handlers.is_empty() {
-            warn!(
-                logger,
-                "No matching handlers found for event with topic0 `{}`",
-                log.topics
-                .iter()
-                .next()
-                .map_or(String::from("none"), |topic0| format!("{:x}", topic0));
-                "data_source" => &data_source_name,
-            );
-            return Ok(state);
+    /// Offchain data sources track done_at which is set once the
+    /// trigger has been processed.
+    fn done_at(&self) -> Option<BlockNumber> {
+        match self.data_source() {
+            DataSource::Onchain(_) => None,
+            DataSource::Offchain(ds) => ds.done_at(),
         }
+    }
 
-        // Process the event with the matching handler
-        let (event_handler, params) = matching_handlers.pop().unwrap();
-
-        if !matching_handlers.is_empty() {
-            return Err(format_err!(
-                "Multiple handlers defined for event `{}`, only one is supported",
-                &event_handler.event
-            ));
+    fn set_done_at(&self, block: Option<BlockNumber>) {
+        match self.data_source() {
+            DataSource::Onchain(_) => {}
+            DataSource::Offchain(ds) => ds.set_done_at(block),
         }
+    }
+}
 
-        self.send_mapping_request(
-            logger,
-            o! {
-                "signature" => &event_handler.event,
-                "address" => format!("{}", &log.address),
-            },
-            state,
-            &event_handler.handler,
-            MappingTrigger::Log {
-                transaction: transaction.cheap_clone(),
-                log: log.cheap_clone(),
-                params,
-                handler: event_handler.clone(),
-            },
-            block,
-            proof_of_indexing,
-        )
-        .await
+impl<C: Blockchain> PartialEq for RuntimeHost<C> {
+    fn eq(&self, other: &Self) -> bool {
+        self.data_source.is_duplicate_of(&other.data_source)
     }
 }

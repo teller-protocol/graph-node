@@ -1,65 +1,35 @@
 pub use prometheus::core::Collector;
 pub use prometheus::{
-    Counter, CounterVec, Error as PrometheusError, Gauge, GaugeVec, Histogram, HistogramOpts,
-    HistogramVec, Opts, Registry,
+    labels, Counter, CounterVec, Error as PrometheusError, Gauge, GaugeVec, Histogram,
+    HistogramOpts, HistogramVec, Opts, Registry,
 };
+
+pub mod registry;
+pub mod subgraph;
+
+pub use registry::MetricsRegistry;
+
 use std::collections::HashMap;
 
 /// Metrics for measuring where time is spent during indexing.
 pub mod stopwatch;
 
-/// Aggregates over individual values.
-pub mod aggregate;
+/// Create an unregistered counter with labels
+pub fn counter_with_labels(
+    name: &str,
+    help: &str,
+    const_labels: HashMap<String, String>,
+) -> Result<Counter, PrometheusError> {
+    let opts = Opts::new(name, help).const_labels(const_labels);
+    Counter::with_opts(opts)
+}
 
-pub trait MetricsRegistry: Send + Sync + 'static {
-    fn new_gauge(
-        &self,
-        name: String,
-        help: String,
-        const_labels: HashMap<String, String>,
-    ) -> Result<Box<Gauge>, PrometheusError>;
-
-    fn new_gauge_vec(
-        &self,
-        name: String,
-        help: String,
-        const_labels: HashMap<String, String>,
-        variable_labels: Vec<String>,
-    ) -> Result<Box<GaugeVec>, PrometheusError>;
-
-    fn new_counter(
-        &self,
-        name: String,
-        help: String,
-        const_labels: HashMap<String, String>,
-    ) -> Result<Box<Counter>, PrometheusError>;
-
-    fn global_counter(&self, name: String) -> Result<Counter, PrometheusError>;
-
-    fn new_counter_vec(
-        &self,
-        name: String,
-        help: String,
-        const_labels: HashMap<String, String>,
-        variable_labels: Vec<String>,
-    ) -> Result<Box<CounterVec>, PrometheusError>;
-
-    fn new_histogram(
-        &self,
-        name: String,
-        help: String,
-        const_labels: HashMap<String, String>,
-        buckets: Vec<f64>,
-    ) -> Result<Box<Histogram>, PrometheusError>;
-
-    fn new_histogram_vec(
-        &self,
-        name: String,
-        help: String,
-        const_labels: HashMap<String, String>,
-        variable_labels: Vec<String>,
-        buckets: Vec<f64>,
-    ) -> Result<Box<HistogramVec>, PrometheusError>;
-
-    fn unregister(&self, metric: Box<dyn Collector>);
+/// Create an unregistered gauge with labels
+pub fn gauge_with_labels(
+    name: &str,
+    help: &str,
+    const_labels: HashMap<String, String>,
+) -> Result<Gauge, PrometheusError> {
+    let opts = Opts::new(name, help).const_labels(const_labels);
+    Gauge::with_opts(opts)
 }

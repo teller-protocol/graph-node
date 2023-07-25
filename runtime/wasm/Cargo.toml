@@ -1,36 +1,29 @@
 [package]
 name = "graph-runtime-wasm"
-version = "0.18.0"
-edition = "2018"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-async-trait = "0.1.31"
-atomic_refcell = "0.1.6"
-ethabi = { git = "https://github.com/graphprotocol/ethabi.git", branch = "master" }
+async-trait = "0.1.50"
+atomic_refcell = "0.1.10"
+ethabi = "17.2"
 futures = "0.1.21"
-hex = "0.4.2"
+hex = "0.4.3"
 graph = { path = "../../graph" }
-graph-graphql = { path = "../../graphql" }
-wasmi = "0.5.1"
-pwasm-utils = "0.11"
-bs58 = "0.3.1"
+bs58 = "0.4.0"
 graph-runtime-derive = { path = "../derive" }
-semver = "0.9.0"
-parity-wasm = "0.40"
+semver = "1.0.18"
 lazy_static = "1.4"
-uuid = { version = "0.8.1", features = ["v4"] }
-strum = "0.18.0"
-strum_macros = "0.18.0"
-bytes = "0.5"
-# TODO: Go back to the crates.io published version once the MaybeOwnedMut
-# PR is merged. https://github.com/rustonaut/maybe-owned/pull/9
-# See also 92cd8019-0136-4011-96a0-40b3eec37f73
-maybe-owned = { git = "https://github.com/rustonaut/maybe-owned", branch = "master" }
+uuid = { version = "1.4.1", features = ["v4"] }
+strum = "0.21.0"
+strum_macros = "0.21.1"
+bytes = "1.0"
+anyhow = "1.0"
+wasmtime = "0.27.0"
+defer = "0.1"
+never = "0.1"
 
-[dev-dependencies]
-graphql-parser = "0.2.3"
-graph-core = { path = "../../core" }
-graph-mock = { path = "../../mock" }
-test-store = { path = "../../store/test-store" }
-ipfs-api = { version = "0.7.1", features = ["hyper-tls"] }
-graph-chain-arweave = { path = "../../chain/arweave" }
+wasm-instrument = { version = "0.2.0", features = ["std", "sign_ext"] }
+
+# AssemblyScript uses sign extensions
+parity-wasm = { version = "0.45", features = ["std", "sign_ext"] }

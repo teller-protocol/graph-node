@@ -1,9 +1,12 @@
 dist: bionic
 language: rust
+# This line would cache cargo-audit once installed,
+# but instead will fail from the 10 minute timeout after
+# printing the line "creating directory /home/travis/.cache/sccache"
+#cache: cargo
 rust:
   - stable
   - beta
-  - nightly
 
 # Select pre-installed services
 addons:
@@ -20,15 +23,13 @@ before_install:
   # Install Node.js 11.x
   - nvm install 11 && nvm use 11
   # Install IPFS
-  - wget "https://dist.ipfs.io/go-ipfs/v0.4.17/go-ipfs_v0.4.17_linux-amd64.tar.gz" -O /tmp/ipfs.tar.gz
+  - wget "https://dist.ipfs.io/go-ipfs/v0.10.0/go-ipfs_v0.10.0_linux-amd64.tar.gz" -O /tmp/ipfs.tar.gz
   - pushd . && cd $HOME/bin && tar -xzvf /tmp/ipfs.tar.gz && popd
   - export PATH="$HOME/bin/go-ipfs:$PATH"
   - ipfs init
 
 matrix:
   fast_finish: true
-  allow_failures:
-    - rust: nightly
   include:
     # Some env var is always necessary to differentiate included builds
     # Check coding style
@@ -73,10 +74,6 @@ script:
   # Run tests
   - ipfs daemon &> /dev/null &
   - RUST_BACKTRACE=1 cargo test --verbose --all -- --nocapture
-  # Run tests again using JSONB storage
-  - psql -c 'drop database graph_node_test;' -U travis
-  - psql -c 'create database graph_node_test;' -U travis
-  - RUST_BACKTRACE=1 GRAPH_STORAGE_SCHEME=json cargo test --verbose --all -- --nocapture
   - killall ipfs
 
 deploy:

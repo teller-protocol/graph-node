@@ -1,11 +1,10 @@
-use graph::prelude::{info, o, Logger, QueryExecutionError};
-use graphql_parser::query as q;
-use std::collections::BTreeMap;
+use graph::prelude::{BlockPtr, CheapClone, QueryExecutionError, QueryResult};
 use std::sync::Arc;
 use std::time::Instant;
-use uuid::Uuid;
 
-use crate::execution::*;
+use graph::data::graphql::effort::LoadManager;
+
+use crate::execution::{ast as a, *};
 
 /// Utilities for working with GraphQL query ASTs.
 pub mod ast;
@@ -14,13 +13,7 @@ pub mod ast;
 pub mod ext;
 
 /// Options available for query execution.
-pub struct QueryExecutionOptions<R>
-where
-    R: Resolver,
-{
-    /// The logger to use during query execution.
-    pub logger: Logger,
-
+pub struct QueryExecutionOptions<R> {
     /// The resolver to use.
     pub resolver: R,
 
@@ -29,57 +22,68 @@ where
 
     /// Maximum value for the `first` argument.
     pub max_first: u32,
+
+    /// Maximum value for the `skip` argument
+    pub max_skip: u32,
+
+    pub load_manager: Arc<LoadManager>,
+
+    /// Whether to include an execution trace in the result
+    pub trace: bool,
 }
 
 /// Executes a query and returns a result.
-pub fn execute_query<R>(
+/// If the query is not cacheable, the `Arc` may be unwrapped.
+pub async fn execute_query<R>(
     query: Arc<Query>,
-    selection_set: Option<&q::SelectionSet>,
+    selection_set: Option<a::SelectionSet>,
+    block_ptr: Option<BlockPtr>,
     options: QueryExecutionOptions<R>,
-) -> Result<BTreeMap<String, q::Value>, Vec<QueryExecutionError>>
+) -> Arc<QueryResult>
 where
     R: Resolver,
 {
-    let query_id = Uuid::new_v4().to_string();
-    let query_logger = options.logger.new(o!(
-        "subgraph_id" => (*query.schema.id).clone(),
-        "query_id" => query_id
-    ));
-
-    let mode = if query.verify {
-        ExecutionMode::Verify
-    } else {
-        ExecutionMode::Prefetch
-    };
-
     // Create a fresh execution context
-    let ctx = ExecutionContext {
-        logger: query_logger.clone(),
-        resolver: Arc::new(options.resolver),
+    let ctx = Arc::new(ExecutionContext {
+        logger: query.logger.clone(),
+        resolver: options.resolver,
         query: query.clone(),
         deadline: options.deadline,
         max_first: options.max_first,
-        mode,
-    };
+        max_skip: options.max_skip,
+        cache_status: Default::default(),
+        trace: options.trace,
+    });
 
     if !query.is_query() {
-        return Err(vec![QueryExecutionError::NotSupported(
-            "Only queries are supported".to_string(),
-        )]);
-    }
-    let selection_set = selection_set.unwrap_or(&query.selection_set);
-
-    // Execute top-level `query { ... }` and `{ ... }` expressions.
-    let start = Instant::now();
-    let result = execute_root_selection_set(&ctx, selection_set);
-    if *graph::log::LOG_GQL_TIMING {
-        info!(
-            query_logger,
-            "Query timing (GraphQL)";
-            "query" => &query.query_text,
-            "variables" => &query.variables_text,
-            "query_time_ms" => start.elapsed().as_millis(),
+        return Arc::new(
+            QueryExecutionError::NotSupported("Only queries are supported".to_string()).into(),
         );
     }
+    let selection_set = selection_set
+        .map(Arc::new)
+        .unwrap_or_else(|| query.selection_set.cheap_clone());
+
+    // Execute top-level `query { ... }` and `{ ... }` expressions.
+    let query_type = ctx.query.schema.query_type.cheap_clone().into();
+    let start = Instant::now();
+    let result = execute_root_selection_set(
+        ctx.cheap_clone(),
+        selection_set.cheap_clone(),
+        query_type,
+        block_ptr.clone(),
+    )
+    .await;
+    let elapsed = start.elapsed();
+    let cache_status = ctx.cache_status.load();
+    options
+        .load_manager
+        .record_work(query.shape_hash, elapsed, cache_status);
+    query.log_cache_status(
+        &selection_set,
+        block_ptr.map(|b| b.number).unwrap_or(0),
+        start,
+        cache_status.to_string(),
+    );
     result
 }

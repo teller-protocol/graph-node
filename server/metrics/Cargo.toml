@@ -1,14 +1,8 @@
 [package]
 name = "graph-server-metrics"
-version = "0.18.0"
-edition = "2018"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-failure = "0.1.7"
-futures = "0.1.21"
 graph = { path = "../../graph" }
-http = "0.2"
-hyper = "0.13"
-lazy_static = "1.2.0"
-serde = "1.0"
-prometheus = "0.7"
+hyper = { version = "0.14", features = ["server"] }

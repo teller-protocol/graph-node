@@ -1,5 +1,5 @@
 # Subgraph Manifest
-##### v.0.0.1
+##### v.0.0.4
 
 ## 1.1 Overview
 The subgraph manifest specifies all the information required to index and query a specific subgraph. This is the entry point to your subgraph.
@@ -20,6 +20,7 @@ Any data format that has a well-defined 1:1 mapping with the [IPLD Canonical For
 | **graft** | optional [*Graft Base*](#18-graft-base) | An optional base to graft onto. |
 | **dataSources**| [*Data Source Spec*](#15-data-source)| Each data source spec defines the data that will be ingested as well as the transformation logic to derive the state of the subgraph's entities based on the source data.|
 | **templates** | [*Data Source Templates Spec*](#17-data-source-templates) | Each data source template defines a data source that can be created dynamically from the mappings. |
+| **features** | optional [*[String]*](#19-features) | A list of feature names used by the subgraph. |
 
 ## 1.4 Schema
 
@@ -33,7 +34,7 @@ Any data format that has a well-defined 1:1 mapping with the [IPLD Canonical For
 | --- | --- | --- |
 | **kind** | *String | The type of data source. Possible values: *ethereum/contract*.|
 | **name** | *String* | The name of the source data. Will be used to generate APIs in the mapping and also for self-documentation purposes. |
-| **network** | *String* | For blockchains, this describes which network the subgraph targets. For Ethereum, this could be, for example, "mainnet" or "rinkeby". |
+| **network** | *String* | For blockchains, this describes which network the subgraph targets. For Ethereum, this can be any of "mainnet", "rinkeby", "kovan", "ropsten", "goerli", "poa-core", "poa-sokol", "xdai", "matic", "mumbai", "fantom", "bsc" or "clover". Developers could look for an up to date list in the graph-cli [*code*](https://github.com/graphprotocol/graph-tooling/blob/main/packages/cli/src/protocols/index.ts#L76-L117).|
 | **source** | [*EthereumContractSource*](#151-ethereumcontractsource) | The source data on a blockchain such as Ethereum. |
 | **mapping** | [*Mapping*](#152-mapping) | The transformation logic applied to the data prior to being indexed. |
 
@@ -86,8 +87,13 @@ The `mapping` field may be one of the following supported mapping manifests:
 | Field | Type | Description |
 | --- | --- | --- |
 | **handler** | *String* | The name of an exported function in the mapping script that should handle the specified event. |
-| **filter** | optional *String* | The name of the filter that will be applied to decide on which blocks will trigger the mapping. If none is supplied, the handler will be called on every block. |
+| **filter** | optional *BlockHandlerFilter* | Definition of the filter to apply. If none is supplied, the handler will be called on every block. |
 
+#### 1.5.2.4.1 BlockHandlerFilter
+
+| Field | Type | Description |
+| --- | --- | --- |
+| **kind** | *String* | The selected block handler filter. Only option for now: `call`: This will only run the handler if the block contains at least one call to the data source contract. |
 
 ## 1.6 Path
 A path has one field `path`, which either refers to a path of a file on the local dev machine or an [IPLD link](https://github.com/ipld/specs/).
@@ -130,3 +136,23 @@ A subgraph can be _grafted_ on top of another subgraph, meaning that, rather tha
 | --- | --- | --- |
 | **base** | *String* | The subgraph ID of the base subgraph |
 | **block** | *BigInt* | The block number up to which to use data from the base subgraph |
+
+## 1.9 Features
+
+Starting from `specVersion` `0.0.4`, a subgraph must declare all _feature_ names it uses to be
+considered valid.
+
+A Graph Node instance will **reject** a subgraph deployment if:
+- the `specVersion` is equal to or higher than `0.0.4` **AND**
+- it hasn't explicitly declared a feature it uses.
+
+No validation errors will happen if a feature is declared but not used.
+
+These are the currently available features and their names:
+
+| Feature                    | Name                      |
+| ---                        | ---                       |
+| Non-fatal errors           | `nonFatalErrors`          |
+| Full-text Search           | `fullTextSearch`          |
+| Grafting                   | `grafting`                |
+| IPFS on Ethereum Contracts | `ipfsOnEthereumContracts` |

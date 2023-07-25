@@ -1,13 +1,15 @@
 {
   "private": true,
   "workspaces": [
-    "arweave-and-3box",
-    "data-source-context",
-    "fatal-error",
+    "api-version-v0-0-4",
     "ganache-reverts",
+    "host-exports",
+    "non-fatal-errors",
     "overloaded-contract-functions",
+    "poi-for-failed-subgraph",
     "remove-then-update",
     "value-roundtrip",
-    "big-decimal"
+    "int8",
+    "derived-loaders"
   ]
 }

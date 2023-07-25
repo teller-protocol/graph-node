@@ -3,7 +3,7 @@ use std::env;
 use std::fs;
 use std::process::exit;
 
-use graph_graphql::schema::api::api_schema;
+use graph::schema::api_schema;
 
 pub fn usage(msg: &str) -> ! {
     println!("{}", msg);
@@ -30,7 +30,10 @@ pub fn main() {
         _ => usage("too many arguments"),
     };
     let schema = ensure(fs::read_to_string(schema), "Can not read schema file");
-    let schema = ensure(parse_schema(&schema), "Failed to parse schema");
+    let schema = ensure(
+        parse_schema(&schema).map(|v| v.into_static()),
+        "Failed to parse schema",
+    );
     let schema = ensure(api_schema(&schema), "Failed to convert to API schema");
 
     println!("{}", schema);

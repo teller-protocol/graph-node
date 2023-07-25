@@ -1,14 +1,20 @@
 [package]
 name = "graph-server-index-node"
-version = "0.18.0"
-edition = "2018"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
-failure = "0.1.7"
+blake3 = "1.4"
+either = "1.9.0"
 futures = "0.3.4"
 graph = { path = "../../graph" }
 graph-graphql = { path = "../../graphql" }
-graphql-parser = "0.2.3"
+graph-chain-arweave = { path = "../../chain/arweave" }
+graph-chain-ethereum = { path = "../../chain/ethereum" }
+graph-chain-near = { path = "../../chain/near" }
+graph-chain-cosmos = { path = "../../chain/cosmos" }
+graphql-parser = "0.4.0"
 http = "0.2"
-hyper = "0.13"
+hyper = "0.14"
+lazy_static = "1.2.0"
 serde = "1.0"

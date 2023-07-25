@@ -1,40 +1,40 @@
-use hyper;
 use hyper::service::make_service_fn;
 use hyper::Server;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
-use graph::prelude::{IndexNodeServer as IndexNodeServerTrait, *};
+use graph::{
+    blockchain::BlockchainMap,
+    components::store::Store,
+    prelude::{IndexNodeServer as IndexNodeServerTrait, *},
+};
 
 use crate::service::IndexNodeService;
+use thiserror::Error;
 
 /// Errors that may occur when starting the server.
-#[derive(Debug, Fail)]
+#[derive(Debug, Error)]
 pub enum IndexNodeServeError {
-    #[fail(display = "Bind error: {}", _0)]
-    BindError(hyper::Error),
-}
-
-impl From<hyper::Error> for IndexNodeServeError {
-    fn from(err: hyper::Error) -> Self {
-        IndexNodeServeError::BindError(err)
-    }
+    #[error("Bind error: {0}")]
+    BindError(#[from] hyper::Error),
 }
 
 /// A GraphQL server based on Hyper.
 pub struct IndexNodeServer<Q, S> {
     logger: Logger,
+    blockchain_map: Arc<BlockchainMap>,
     graphql_runner: Arc<Q>,
     store: Arc<S>,
-    node_id: NodeId,
+    link_resolver: Arc<dyn LinkResolver>,
 }
 
 impl<Q, S> IndexNodeServer<Q, S> {
     /// Creates a new GraphQL server.
     pub fn new(
         logger_factory: &LoggerFactory,
+        blockchain_map: Arc<BlockchainMap>,
         graphql_runner: Arc<Q>,
         store: Arc<S>,
-        node_id: NodeId,
+        link_resolver: Arc<dyn LinkResolver>,
     ) -> Self {
         let logger = logger_factory.component_logger(
             "IndexNodeServer",
@@ -47,9 +47,10 @@ impl<Q, S> IndexNodeServer<Q, S> {
 
         IndexNodeServer {
             logger,
+            blockchain_map,
             graphql_runner,
             store,
-            node_id,
+            link_resolver,
         }
     }
 }
@@ -57,7 +58,7 @@ impl<Q, S> IndexNodeServer<Q, S> {
 impl<Q, S> IndexNodeServerTrait for IndexNodeServer<Q, S>
 where
     Q: GraphQlRunner,
-    S: SubgraphDeploymentStore + Store,
+    S: Store,
 {
     type ServeError = IndexNodeServeError;
 
@@ -79,15 +80,15 @@ where
         let logger_for_service = self.logger.clone();
         let graphql_runner = self.graphql_runner.clone();
         let store = self.store.clone();
-        let node_id = self.node_id.clone();
-        let new_service = make_service_fn(move |_| {
-            futures03::future::ok::<_, Error>(IndexNodeService::new(
-                logger_for_service.clone(),
-                graphql_runner.clone(),
-                store.clone(),
-                node_id.clone(),
-            ))
-        });
+        let service = IndexNodeService::new(
+            logger_for_service.clone(),
+            self.blockchain_map.clone(),
+            graphql_runner,
+            store,
+            self.link_resolver.clone(),
+        );
+        let new_service =
+            make_service_fn(move |_| futures03::future::ok::<_, Error>(service.clone()));
 
         // Create a task to run the server and handle HTTP requests
         let task = Server::try_bind(&addr.into())?

@@ -1,10 +1,10 @@
-use failure::Error;
-use futures::future::Fuse;
-use futures::prelude::{Future, Poll, Stream};
-use futures::sync::oneshot;
-use futures03::compat::{Compat01As03, Future01CompatExt};
-use std::fmt;
+use crate::prelude::tokio::macros::support::Poll;
+use crate::prelude::{Pin, StoreError};
+use futures03::channel::oneshot;
+use futures03::{future::Fuse, Future, FutureExt, Stream};
+use std::fmt::{Debug, Display};
 use std::sync::{Arc, Mutex, Weak};
+use std::task::Context;
 use std::time::Duration;
 
 /// A cancelable stream or future.
@@ -17,35 +17,36 @@ pub struct Cancelable<T, C> {
     on_cancel: C,
 }
 
-/// It's not viable to use `select` directly, so we do a custom implementation.
-impl<S: Stream, C: Fn() -> S::Error> Stream for Cancelable<S, C> {
-    type Item = S::Item;
-    type Error = S::Error;
+impl<T, C> Cancelable<T, C> {
+    pub fn get_mut(&mut self) -> &mut T {
+        &mut self.inner
+    }
+}
 
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
+/// It's not viable to use `select` directly, so we do a custom implementation.
+impl<S: Stream + Unpin, C: Fn() -> S::Item + Unpin> Stream for Cancelable<S, C> {
+    type Item = S::Item;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         // Error if the stream was canceled by dropping the sender.
-        // `cancel_receiver` is fused so we may ignore `Ok`s.
-        if self.cancel_receiver.poll().is_err() {
-            Err((self.on_cancel)())
-        // Otherwise poll it.
-        } else {
-            self.inner.poll()
+        match self.cancel_receiver.poll_unpin(cx) {
+            Poll::Ready(Ok(_)) => unreachable!(),
+            Poll::Ready(Err(_)) => Poll::Ready(Some((self.on_cancel)())),
+            Poll::Pending => Pin::new(&mut self.inner).poll_next(cx),
         }
     }
 }
 
-impl<F: Future, C: Fn() -> F::Error> Future for Cancelable<F, C> {
-    type Item = F::Item;
-    type Error = F::Error;
+impl<F: Future + Unpin, C: Fn() -> F::Output + Unpin> Future for Cancelable<F, C> {
+    type Output = F::Output;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // Error if the future was canceled by dropping the sender.
-        // `cancel_receiver` is fused so we may ignore `Ok`s.
-        if self.cancel_receiver.poll().is_err() {
-            Err((self.on_cancel)())
-        // Otherwise poll it.
-        } else {
-            self.inner.poll()
+        // `canceled` is fused so we may ignore `Ok`s.
+        match self.cancel_receiver.poll_unpin(cx) {
+            Poll::Ready(Ok(_)) => unreachable!(),
+            Poll::Ready(Err(_)) => Poll::Ready((self.on_cancel)()),
+            Poll::Pending => Pin::new(&mut self.inner).poll(cx),
         }
     }
 }
@@ -142,7 +143,7 @@ impl Canceler for CancelHandle {
 /// an `Arc`.
 ///
 /// To cancel guarded streams or futures, call `cancel` or drop the guard.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SharedCancelGuard {
     guard: Mutex<Option<CancelGuard>>,
 }
@@ -168,6 +169,14 @@ impl SharedCancelGuard {
         } else {
             // A handle that is always canceled.
             CancelHandle { guard: Weak::new() }
+        }
+    }
+}
+
+impl Default for SharedCancelGuard {
+    fn default() -> Self {
+        Self {
+            guard: Mutex::new(Some(CancelGuard::new())),
         }
     }
 }
@@ -199,8 +208,7 @@ pub trait StreamExtension: Stream + Sized {
     /// When `cancel` is called on a `CancelGuard` or it is dropped,
     /// `Cancelable` receives an error.
     ///
-    /// `on_cancel` is called to make an error value upon cancelation.
-    fn cancelable<C: Fn() -> Self::Error>(
+    fn cancelable<C: Fn() -> Self::Item>(
         self,
         guard: &impl Canceler,
         on_cancel: C,
@@ -208,7 +216,7 @@ pub trait StreamExtension: Stream + Sized {
 }
 
 impl<S: Stream> StreamExtension for S {
-    fn cancelable<C: Fn() -> S::Error>(
+    fn cancelable<C: Fn() -> S::Item>(
         self,
         guard: &impl Canceler,
         on_cancel: C,
@@ -228,17 +236,17 @@ pub trait FutureExtension: Future + Sized {
     /// `Cancelable` receives an error.
     ///
     /// `on_cancel` is called to make an error value upon cancelation.
-    fn cancelable<C: Fn() -> Self::Error>(
+    fn cancelable<C: Fn() -> Self::Output>(
         self,
         guard: &impl Canceler,
         on_cancel: C,
     ) -> Cancelable<Self, C>;
 
-    fn timeout(self, dur: Duration) -> tokio::time::Timeout<Compat01As03<Self>>;
+    fn timeout(self, dur: Duration) -> tokio::time::Timeout<Self>;
 }
 
 impl<F: Future> FutureExtension for F {
-    fn cancelable<C: Fn() -> F::Error>(
+    fn cancelable<C: Fn() -> F::Output>(
         self,
         guard: &impl Canceler,
         on_cancel: C,
@@ -252,43 +260,71 @@ impl<F: Future> FutureExtension for F {
         }
     }
 
-    fn timeout(self, dur: Duration) -> tokio::time::Timeout<Compat01As03<Self>> {
-        tokio::time::timeout(dur, self.compat())
+    fn timeout(self, dur: Duration) -> tokio::time::Timeout<Self> {
+        tokio::time::timeout(dur, self)
     }
 }
 
-#[derive(Debug)]
-pub enum CancelableError<E = Error> {
+#[derive(thiserror::Error, Debug)]
+pub enum CancelableError<E: Display + Debug> {
+    #[error("operation canceled")]
     Cancel,
+
+    #[error("{0:}")]
     Error(E),
 }
 
-impl From<Error> for CancelableError<Error> {
-    fn from(e: Error) -> Self {
+impl From<StoreError> for CancelableError<anyhow::Error> {
+    fn from(e: StoreError) -> Self {
+        Self::Error(anyhow::Error::from(e))
+    }
+}
+
+impl From<CancelableError<anyhow::Error>> for CancelableError<StoreError> {
+    fn from(e: CancelableError<anyhow::Error>) -> Self {
+        match e {
+            CancelableError::Error(e) => CancelableError::Error(e.into()),
+            CancelableError::Cancel => CancelableError::Cancel,
+        }
+    }
+}
+
+impl From<StoreError> for CancelableError<StoreError> {
+    fn from(e: StoreError) -> Self {
         Self::Error(e)
     }
 }
 
-impl<E> From<Canceled> for CancelableError<E> {
+impl<E: Display + Debug> From<Canceled> for CancelableError<E> {
     fn from(_: Canceled) -> Self {
         Self::Cancel
     }
 }
 
-impl From<diesel::result::Error> for CancelableError<Error> {
+impl From<diesel::result::Error> for CancelableError<anyhow::Error> {
     fn from(e: diesel::result::Error) -> Self {
         Self::Error(e.into())
     }
 }
 
-impl<E> fmt::Display for CancelableError<E>
-where
-    E: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self {
-            CancelableError::Error(e) => e.fmt(f),
-            CancelableError::Cancel => write!(f, "operation canceled"),
+impl From<diesel::result::Error> for CancelableError<StoreError> {
+    fn from(e: diesel::result::Error) -> Self {
+        Self::Error(e.into())
+    }
+}
+
+impl From<anyhow::Error> for CancelableError<anyhow::Error> {
+    fn from(e: anyhow::Error) -> Self {
+        Self::Error(e)
+    }
+}
+
+impl From<CancelableError<StoreError>> for StoreError {
+    fn from(err: CancelableError<StoreError>) -> StoreError {
+        use CancelableError::*;
+        match err {
+            Cancel => StoreError::Canceled,
+            Error(e) => e,
         }
     }
 }

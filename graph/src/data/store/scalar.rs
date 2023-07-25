@@ -1,30 +1,33 @@
 use diesel::deserialize::FromSql;
 use diesel::serialize::ToSql;
 use diesel_derives::{AsExpression, FromSqlRow};
-use failure::Fail;
 use hex;
 use num_bigint;
 use serde::{self, Deserialize, Serialize};
+use stable_hash::utils::AsInt;
+use stable_hash::{FieldAddress, StableHash};
+use stable_hash_legacy::SequenceNumber;
+use thiserror::Error;
 use web3::types::*;
 
-use stable_hash::{
-    prelude::*,
-    utils::{AsBytes, AsInt},
-};
 use std::convert::{TryFrom, TryInto};
 use std::fmt::{self, Display, Formatter};
 use std::io::Write;
-use std::ops::{Add, Deref, Div, Mul, Rem, Sub};
+use std::ops::{Add, BitAnd, BitOr, Deref, Div, Mul, Rem, Shl, Shr, Sub};
 use std::str::FromStr;
 
 pub use num_bigint::Sign as BigIntSign;
+
+use crate::blockchain::BlockHash;
+use crate::runtime::gas::{Gas, GasSizeOf, SaturatingInto};
+use crate::util::stable_hash_glue::{impl_stable_hash, AsBytes};
 
 /// All operations on `BigDecimal` return a normalized value.
 // Caveat: The exponent is currently an i64 and may overflow. See
 // https://github.com/akubera/bigdecimal-rs/issues/54.
 // Using `#[serde(from = "BigDecimal"]` makes sure deserialization calls `BigDecimal::new()`.
 #[derive(
-    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, AsExpression, FromSqlRow,
+    Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, AsExpression, FromSqlRow,
 )]
 #[serde(from = "bigdecimal::BigDecimal")]
 #[sql_type = "diesel::sql_types::Numeric"]
@@ -45,7 +48,11 @@ impl BigDecimal {
 
     pub fn new(digits: BigInt, exp: i64) -> Self {
         // bigdecimal uses `scale` as the opposite of the power of ten, so negate `exp`.
-        Self::from(bigdecimal::BigDecimal::new(digits.0, -exp))
+        Self::from(bigdecimal::BigDecimal::new(digits.inner(), -exp))
+    }
+
+    pub fn parse_bytes(bytes: &[u8]) -> Option<Self> {
+        bigdecimal::BigDecimal::parse_bytes(bytes, 10).map(Self)
     }
 
     pub fn zero() -> BigDecimal {
@@ -58,7 +65,7 @@ impl BigDecimal {
         self.0.as_bigint_and_exponent()
     }
 
-    pub(crate) fn digits(&self) -> u64 {
+    pub fn digits(&self) -> u64 {
         self.0.digits()
     }
 
@@ -80,13 +87,19 @@ impl BigDecimal {
         let int_val = num_bigint::BigInt::from_radix_be(sign, &digits, 10).unwrap();
         let scale = exp - trailing_count as i64;
 
-        BigDecimal(bigdecimal::BigDecimal::new(int_val.into(), scale))
+        BigDecimal(bigdecimal::BigDecimal::new(int_val, scale))
     }
 }
 
 impl Display for BigDecimal {
     fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
         self.0.fmt(f)
+    }
+}
+
+impl fmt::Debug for BigDecimal {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "BigDecimal({})", self.0)
     }
 }
 
@@ -185,35 +198,144 @@ impl bigdecimal::ToPrimitive for BigDecimal {
     }
 }
 
-impl StableHash for BigDecimal {
-    fn stable_hash<H: StableHasher>(&self, mut sequence_number: H::Seq, state: &mut H) {
+impl stable_hash_legacy::StableHash for BigDecimal {
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        mut sequence_number: H::Seq,
+        state: &mut H,
+    ) {
         let (int, exp) = self.as_bigint_and_exponent();
         // This only allows for backward compatible changes between
         // BigDecimal and unsigned ints
-        exp.stable_hash(sequence_number.next_child(), state);
-        BigInt(int).stable_hash(sequence_number, state);
+        stable_hash_legacy::StableHash::stable_hash(&exp, sequence_number.next_child(), state);
+        stable_hash_legacy::StableHash::stable_hash(
+            &BigInt::unchecked_new(int),
+            sequence_number,
+            state,
+        );
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub struct BigInt(num_bigint::BigInt);
+impl StableHash for BigDecimal {
+    fn stable_hash<H: stable_hash::StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        // This implementation allows for backward compatible changes from integers (signed or unsigned)
+        // when the exponent is zero.
+        let (int, exp) = self.as_bigint_and_exponent();
+        StableHash::stable_hash(&exp, field_address.child(1), state);
+        // Normally it would be a red flag to pass field_address in after having used a child slot.
+        // But, we know the implemecntation of StableHash for BigInt will not use child(1) and that
+        // it will not in the future due to having no forward schema evolutions for ints and the
+        // stability guarantee.
+        //
+        // For reference, ints use child(0) for the sign and write the little endian bytes to the parent slot.
+        BigInt::unchecked_new(int).stable_hash(field_address, state);
+    }
+}
 
-impl StableHash for BigInt {
+impl GasSizeOf for BigDecimal {
+    fn gas_size_of(&self) -> Gas {
+        let (int, _) = self.as_bigint_and_exponent();
+        BigInt::unchecked_new(int).gas_size_of()
+    }
+}
+
+// Use a private module to ensure a constructor is used.
+pub use big_int::BigInt;
+mod big_int {
+    use std::{
+        f32::consts::LOG2_10,
+        fmt::{self, Display, Formatter},
+    };
+
+    #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+    pub struct BigInt(num_bigint::BigInt);
+
+    impl Display for BigInt {
+        fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
+            self.0.fmt(f)
+        }
+    }
+
+    impl BigInt {
+        // Postgres `numeric` has a limit documented here [https://www.postgresql.org/docs/current/datatype-numeric.htm]:
+        // "Up to 131072 digits before the decimal point; up to 16383 digits after the decimal point"
+        // So based on this we adopt a limit of 131072 decimal digits for big int, converted here to bits.
+        pub const MAX_BITS: u32 = (131072.0 * LOG2_10) as u32 + 1; // 435_412
+
+        pub fn new(inner: num_bigint::BigInt) -> Result<Self, anyhow::Error> {
+            // `inner.bits()` won't include the sign bit, so we add 1 to account for it.
+            let bits = inner.bits() + 1;
+            if bits > Self::MAX_BITS as usize {
+                anyhow::bail!(
+                    "BigInt is too big, total bits {} (max {})",
+                    bits,
+                    Self::MAX_BITS
+                );
+            }
+            Ok(Self(inner))
+        }
+
+        /// Creates a BigInt without checking the digit limit.
+        pub(super) fn unchecked_new(inner: num_bigint::BigInt) -> Self {
+            Self(inner)
+        }
+
+        pub fn sign(&self) -> num_bigint::Sign {
+            self.0.sign()
+        }
+
+        pub fn to_bytes_le(&self) -> (super::BigIntSign, Vec<u8>) {
+            self.0.to_bytes_le()
+        }
+
+        pub fn to_bytes_be(&self) -> (super::BigIntSign, Vec<u8>) {
+            self.0.to_bytes_be()
+        }
+
+        pub fn to_signed_bytes_le(&self) -> Vec<u8> {
+            self.0.to_signed_bytes_le()
+        }
+
+        pub fn bits(&self) -> usize {
+            self.0.bits()
+        }
+
+        pub(super) fn inner(self) -> num_bigint::BigInt {
+            self.0
+        }
+    }
+}
+
+impl stable_hash_legacy::StableHash for BigInt {
     #[inline]
-    fn stable_hash<H: StableHasher>(&self, sequence_number: H::Seq, state: &mut H) {
-        AsInt {
-            is_negative: self.0.sign() == BigIntSign::Minus,
+    fn stable_hash<H: stable_hash_legacy::StableHasher>(
+        &self,
+        sequence_number: H::Seq,
+        state: &mut H,
+    ) {
+        stable_hash_legacy::utils::AsInt {
+            is_negative: self.sign() == BigIntSign::Minus,
             little_endian: &self.to_bytes_le().1,
         }
         .stable_hash(sequence_number, state)
     }
 }
 
-#[derive(Fail, Debug)]
+impl StableHash for BigInt {
+    fn stable_hash<H: stable_hash::StableHasher>(&self, field_address: H::Addr, state: &mut H) {
+        AsInt {
+            is_negative: self.sign() == BigIntSign::Minus,
+            little_endian: &self.to_bytes_le().1,
+        }
+        .stable_hash(field_address, state)
+    }
+}
+
+#[derive(Error, Debug)]
 pub enum BigIntOutOfRangeError {
-    #[fail(display = "Cannot convert negative BigInt into type")]
+    #[error("Cannot convert negative BigInt into type")]
     Negative,
-    #[fail(display = "BigInt value is too large for type")]
+    #[error("BigInt value is too large for type")]
     Overflow,
 }
 
@@ -234,7 +356,7 @@ impl<'a> TryFrom<&'a BigInt> for u64 {
         let mut n = 0u64;
         let mut shift_dist = 0;
         for b in bytes {
-            n = ((b as u64) << shift_dist) | n;
+            n |= (b as u64) << shift_dist;
             shift_dist += 8;
         }
         Ok(n)
@@ -248,28 +370,26 @@ impl TryFrom<BigInt> for u64 {
     }
 }
 
+impl fmt::Debug for BigInt {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "BigInt({})", self)
+    }
+}
+
 impl BigInt {
-    pub fn from_unsigned_bytes_le(bytes: &[u8]) -> Self {
-        BigInt(num_bigint::BigInt::from_bytes_le(
+    pub fn from_unsigned_bytes_le(bytes: &[u8]) -> Result<Self, anyhow::Error> {
+        BigInt::new(num_bigint::BigInt::from_bytes_le(
             num_bigint::Sign::Plus,
             bytes,
         ))
     }
 
-    pub fn from_signed_bytes_le(bytes: &[u8]) -> Self {
-        BigInt(num_bigint::BigInt::from_signed_bytes_le(bytes))
+    pub fn from_signed_bytes_le(bytes: &[u8]) -> Result<Self, anyhow::Error> {
+        BigInt::new(num_bigint::BigInt::from_signed_bytes_le(bytes))
     }
 
-    pub fn to_bytes_le(&self) -> (BigIntSign, Vec<u8>) {
-        self.0.to_bytes_le()
-    }
-
-    pub fn to_bytes_be(&self) -> (BigIntSign, Vec<u8>) {
-        self.0.to_bytes_be()
-    }
-
-    pub fn to_signed_bytes_le(&self) -> Vec<u8> {
-        self.0.to_signed_bytes_le()
+    pub fn from_signed_bytes_be(bytes: &[u8]) -> Result<Self, anyhow::Error> {
+        BigInt::new(num_bigint::BigInt::from_signed_bytes_be(bytes))
     }
 
     /// Deprecated. Use try_into instead
@@ -277,16 +397,24 @@ impl BigInt {
         self.try_into().unwrap()
     }
 
+    pub fn from_unsigned_u128(n: U128) -> Self {
+        let mut bytes: [u8; 16] = [0; 16];
+        n.to_little_endian(&mut bytes);
+        // Unwrap: 128 bits is much less than BigInt::MAX_BITS
+        BigInt::from_unsigned_bytes_le(&bytes).unwrap()
+    }
+
     pub fn from_unsigned_u256(n: &U256) -> Self {
         let mut bytes: [u8; 32] = [0; 32];
         n.to_little_endian(&mut bytes);
-        BigInt::from_unsigned_bytes_le(&bytes)
+        // Unwrap: 256 bits is much less than BigInt::MAX_BITS
+        BigInt::from_unsigned_bytes_le(&bytes).unwrap()
     }
 
     pub fn from_signed_u256(n: &U256) -> Self {
         let mut bytes: [u8; 32] = [0; 32];
         n.to_little_endian(&mut bytes);
-        BigInt::from_signed_bytes_le(&bytes)
+        BigInt::from_signed_bytes_le(&bytes).unwrap()
     }
 
     pub fn to_signed_u256(&self) -> U256 {
@@ -314,44 +442,28 @@ impl BigInt {
         U256::from_little_endian(&bytes)
     }
 
-    pub fn pow(self, exponent: u8) -> Self {
+    pub fn pow(self, exponent: u8) -> Result<BigInt, anyhow::Error> {
         use num_traits::pow::Pow;
 
-        BigInt(self.0.pow(&exponent))
-    }
-
-    pub fn bits(&self) -> u64 {
-        self.0.bits() as u64
-    }
-}
-
-impl Display for BigInt {
-    fn fmt(&self, f: &mut Formatter) -> Result<(), fmt::Error> {
-        self.0.fmt(f)
-    }
-}
-
-impl From<num_bigint::BigInt> for BigInt {
-    fn from(big_int: num_bigint::BigInt) -> BigInt {
-        BigInt(big_int)
+        BigInt::new(self.inner().pow(&exponent))
     }
 }
 
 impl From<i32> for BigInt {
     fn from(i: i32) -> BigInt {
-        BigInt(i.into())
+        BigInt::unchecked_new(i.into())
     }
 }
 
 impl From<u64> for BigInt {
     fn from(i: u64) -> BigInt {
-        BigInt(i.into())
+        BigInt::unchecked_new(i.into())
     }
 }
 
 impl From<i64> for BigInt {
     fn from(i: i64) -> BigInt {
-        BigInt(i.into())
+        BigInt::unchecked_new(i.into())
     }
 }
 
@@ -366,24 +478,13 @@ impl From<U64> for BigInt {
     }
 }
 
-impl From<U128> for BigInt {
-    /// This implementation assumes that U128 represents an unsigned U128,
-    /// and not a signed U128 (aka int128 in Solidity). Right now, this is
-    /// all we need (for block numbers). If it ever becomes necessary to
-    /// handle signed U128s, we should add the same
-    /// `{to,from}_{signed,unsigned}_u128` methods that we have for U256.
-    fn from(n: U128) -> BigInt {
-        let mut bytes: [u8; 16] = [0; 16];
-        n.to_little_endian(&mut bytes);
-        BigInt::from_unsigned_bytes_le(&bytes)
-    }
-}
-
 impl FromStr for BigInt {
-    type Err = <num_bigint::BigInt as FromStr>::Err;
+    type Err = anyhow::Error;
 
     fn from_str(s: &str) -> Result<BigInt, Self::Err> {
-        num_bigint::BigInt::from_str(s).map(BigInt)
+        num_bigint::BigInt::from_str(s)
+            .map_err(anyhow::Error::from)
+            .and_then(BigInt::new)
     }
 }
 
@@ -406,7 +507,7 @@ impl Add for BigInt {
     type Output = BigInt;
 
     fn add(self, other: BigInt) -> BigInt {
-        BigInt(self.0.add(other.0))
+        BigInt::unchecked_new(self.inner().add(other.inner()))
     }
 }
 
@@ -414,7 +515,7 @@ impl Sub for BigInt {
     type Output = BigInt;
 
     fn sub(self, other: BigInt) -> BigInt {
-        BigInt(self.0.sub(other.0))
+        BigInt::unchecked_new(self.inner().sub(other.inner()))
     }
 }
 
@@ -422,7 +523,7 @@ impl Mul for BigInt {
     type Output = BigInt;
 
     fn mul(self, other: BigInt) -> BigInt {
-        BigInt(self.0.mul(other.0))
+        BigInt::unchecked_new(self.inner().mul(other.inner()))
     }
 }
 
@@ -434,7 +535,7 @@ impl Div for BigInt {
             panic!("Cannot divide by zero-valued `BigInt`!")
         }
 
-        BigInt(self.0.div(other.0))
+        BigInt::unchecked_new(self.inner().div(other.inner()))
     }
 }
 
@@ -442,12 +543,53 @@ impl Rem for BigInt {
     type Output = BigInt;
 
     fn rem(self, other: BigInt) -> BigInt {
-        BigInt(self.0.rem(other.0))
+        BigInt::unchecked_new(self.inner().rem(other.inner()))
+    }
+}
+
+impl BitOr for BigInt {
+    type Output = Self;
+
+    fn bitor(self, other: Self) -> Self {
+        BigInt::unchecked_new(self.inner().bitor(other.inner()))
+    }
+}
+
+impl BitAnd for BigInt {
+    type Output = Self;
+
+    fn bitand(self, other: Self) -> Self {
+        BigInt::unchecked_new(self.inner().bitand(other.inner()))
+    }
+}
+
+impl Shl<u8> for BigInt {
+    type Output = Self;
+
+    fn shl(self, bits: u8) -> Self {
+        BigInt::unchecked_new(self.inner().shl(bits.into()))
+    }
+}
+
+impl Shr<u8> for BigInt {
+    type Output = Self;
+
+    fn shr(self, bits: u8) -> Self {
+        BigInt::unchecked_new(self.inner().shr(bits.into()))
+    }
+}
+
+impl GasSizeOf for BigInt {
+    fn gas_size_of(&self) -> Gas {
+        // Add one to always have an upper bound on the number of bytes required to represent the
+        // number, and so that `0` has a size of 1.
+        let n_bytes = self.bits() / 8 + 1;
+        n_bytes.saturating_into()
     }
 }
 
 /// A byte array that's serialized as a hex string prefixed by `0x`.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Bytes(Box<[u8]>);
 
 impl Deref for Bytes {
@@ -457,11 +599,13 @@ impl Deref for Bytes {
     }
 }
 
-impl StableHash for Bytes {
-    fn stable_hash<H: StableHasher>(&self, sequence_number: H::Seq, state: &mut H) {
-        AsBytes(&self.0).stable_hash(sequence_number, state);
+impl fmt::Debug for Bytes {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "Bytes(0x{})", hex::encode(&self.0))
     }
 }
+
+impl_stable_hash!(Bytes(transparent: AsBytes));
 
 impl Bytes {
     pub fn as_slice(&self) -> &[u8] {
@@ -495,6 +639,18 @@ impl From<Address> for Bytes {
     }
 }
 
+impl From<web3::types::Bytes> for Bytes {
+    fn from(bytes: web3::types::Bytes) -> Bytes {
+        Bytes::from(bytes.0.as_slice())
+    }
+}
+
+impl From<BlockHash> for Bytes {
+    fn from(hash: BlockHash) -> Self {
+        Bytes(hash.0)
+    }
+}
+
 impl Serialize for Bytes {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         self.to_string().serialize(serializer)
@@ -510,19 +666,31 @@ impl<'de> Deserialize<'de> for Bytes {
     }
 }
 
+impl<const N: usize> From<[u8; N]> for Bytes {
+    fn from(array: [u8; N]) -> Bytes {
+        Bytes(array.into())
+    }
+}
+
+impl From<Vec<u8>> for Bytes {
+    fn from(vec: Vec<u8>) -> Self {
+        Bytes(vec.into())
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use super::{BigDecimal, BigInt};
-    use stable_hash::crypto::SetHasher;
-    use stable_hash::prelude::*;
-    use stable_hash::utils::stable_hash;
+    use super::{BigDecimal, BigInt, Bytes};
+    use stable_hash_legacy::crypto::SetHasher;
+    use stable_hash_legacy::prelude::*;
+    use stable_hash_legacy::utils::stable_hash;
     use std::str::FromStr;
     use web3::types::U64;
 
     #[test]
     fn bigint_to_from_u64() {
         for n in 0..100 {
-            let u = U64::from(n as u64);
+            let u = U64::from(n);
             let bn = BigInt::from(u);
             assert_eq!(n, bn.to_u64());
         }
@@ -544,7 +712,10 @@ mod test {
         same_stable_hash(1, BigInt::from(1u64));
         same_stable_hash(1u64 << 20, BigInt::from(1u64 << 20));
 
-        same_stable_hash(-1, BigInt::from_signed_bytes_le(&(-1i32).to_le_bytes()));
+        same_stable_hash(
+            -1,
+            BigInt::from_signed_bytes_le(&(-1i32).to_le_bytes()).unwrap(),
+        );
     }
 
     #[test]
@@ -611,5 +782,15 @@ mod test {
             assert_eq!(not_normalized.normalized().to_string(), string);
             assert_eq!(normalized.to_string(), string);
         }
+    }
+
+    #[test]
+    fn fmt_debug() {
+        let bi = BigInt::from(-17);
+        let bd = BigDecimal::new(bi.clone(), -2);
+        let bytes = Bytes::from([222, 173, 190, 239].as_slice());
+        assert_eq!("BigInt(-17)", format!("{:?}", bi));
+        assert_eq!("BigDecimal(-0.17)", format!("{:?}", bd));
+        assert_eq!("Bytes(0xdeadbeef)", format!("{:?}", bytes));
     }
 }

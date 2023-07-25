@@ -1,12 +1,14 @@
-use graphql_parser::{self, schema::Document, schema::Name, schema::ObjectType};
+use std::sync::Arc;
 
+use graphql_parser;
+
+use graph::data::graphql::ext::DocumentExt;
 use graph::data::graphql::ext::ObjectTypeExt;
-use graph::data::schema::Schema;
-use graph::data::subgraph::SubgraphDeploymentId;
+use graph::prelude::s::Document;
 
 use lazy_static::lazy_static;
 
-use crate::schema::ast as sast;
+use graph::schema::ast as sast;
 
 const INTROSPECTION_SCHEMA: &str = "
 scalar Boolean
@@ -117,14 +119,14 @@ enum __DirectiveLocation {
 lazy_static! {
     pub static ref INTROSPECTION_DOCUMENT: Document =
         graphql_parser::parse_schema(INTROSPECTION_SCHEMA).unwrap();
-    pub static ref INTROSPECTION_QUERY_TYPE: &'static ObjectType =
-        sast::get_root_query_type(&*INTROSPECTION_DOCUMENT).unwrap();
+    pub static ref INTROSPECTION_QUERY_TYPE: sast::ObjectType = sast::ObjectType::from(Arc::new(
+        INTROSPECTION_DOCUMENT
+            .get_root_query_type()
+            .unwrap()
+            .clone()
+    ));
 }
 
-pub fn introspection_schema(id: SubgraphDeploymentId) -> Schema {
-    Schema::new(id, INTROSPECTION_DOCUMENT.clone())
-}
-
-pub fn is_introspection_field(name: &Name) -> bool {
+pub fn is_introspection_field(name: &str) -> bool {
     INTROSPECTION_QUERY_TYPE.field(name).is_some()
 }

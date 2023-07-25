@@ -6,41 +6,83 @@
 //!
 //! The pivotal struct in this module is the `Layout` which handles all the
 //! information about mapping a GraphQL schema to database tables
-use diesel::connection::SimpleConnection;
-use diesel::{
-    debug_query, ExpressionMethods, OptionalExtension, PgConnection, QueryDsl, RunQueryDsl,
-};
-use graphql_parser::query as q;
-use graphql_parser::schema as s;
+
+mod ddl;
+
+#[cfg(test)]
+mod ddl_tests;
+#[cfg(test)]
+mod query_tests;
+
+pub(crate) mod index;
+mod prune;
+
+use diesel::pg::Pg;
+use diesel::serialize::Output;
+use diesel::sql_types::Text;
+use diesel::types::{FromSql, ToSql};
+use diesel::{connection::SimpleConnection, Connection};
+use diesel::{debug_query, OptionalExtension, PgConnection, RunQueryDsl};
+use graph::cheap_clone::CheapClone;
+use graph::components::store::write::RowGroup;
+use graph::constraint_violation;
+use graph::data::graphql::TypeExt as _;
+use graph::data::query::Trace;
+use graph::data::value::Word;
+use graph::data_source::CausalityRegion;
+use graph::prelude::{q, s, EntityQuery, StopwatchMetrics, ENV_VARS};
+use graph::schema::{FulltextConfig, FulltextDefinition, InputSchema, SCHEMA_TYPE_NAME};
+use graph::slog::warn;
 use inflector::Inflector;
+use itertools::Itertools;
+use lazy_static::lazy_static;
+use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::convert::{From, TryFrom, TryInto};
+use std::convert::{From, TryFrom};
 use std::fmt::{self, Write};
 use std::str::FromStr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::relational_queries::{
-    self as rq, ClampRangeQuery, ConflictingEntityQuery, DeleteByPrefixQuery,
-    DeleteDynamicDataSourcesQuery, DeleteQuery, EntityData, FilterCollection, FilterQuery,
-    FindManyQuery, FindQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery, UpdateQuery,
+use crate::relational_queries::{FindChangesQuery, FindDerivedQuery, FindPossibleDeletionsQuery};
+use crate::{
+    primary::{Namespace, Site},
+    relational_queries::{
+        ClampRangeQuery, ConflictingEntityQuery, EntityData, EntityDeletion, FilterCollection,
+        FilterQuery, FindManyQuery, FindQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
+    },
 };
-use graph::data::graphql::ext::{DocumentExt, ObjectTypeExt};
-use graph::data::schema::{FulltextConfig, FulltextDefinition, Schema, SCHEMA_TYPE_NAME};
+use graph::components::store::{DerivedEntityQuery, EntityKey, EntityType};
+use graph::data::graphql::ext::{DirectiveFinder, ObjectTypeExt};
 use graph::data::store::BYTES_SCALAR;
-use graph::data::subgraph::schema::{
-    DynamicEthereumContractDataSourceEntity, POI_OBJECT, POI_TABLE,
-};
+use graph::data::subgraph::schema::{POI_DIGEST, POI_OBJECT, POI_TABLE};
 use graph::prelude::{
-    format_err, info, BlockNumber, Entity, EntityChange, EntityChangeOperation, EntityCollection,
-    EntityFilter, EntityKey, EntityOrder, EntityRange, EthereumBlockPointer, Logger,
-    QueryExecutionError, StoreError, StoreEvent, SubgraphDeploymentId, Value, ValueType,
-    BLOCK_NUMBER_MAX,
+    anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityOperation, Logger,
+    QueryExecutionError, StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
 };
 
-use crate::block_range::{BLOCK_RANGE_COLUMN, BLOCK_UNVERSIONED};
+use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
 pub use crate::catalog::Catalog;
-use crate::entities::STRING_PREFIX_SIZE;
+use crate::connection_pool::ForeignServer;
+use crate::{catalog, deployment};
+
+const DELETE_OPERATION_CHUNK_SIZE: usize = 1_000;
+
+/// The size of string prefixes that we index. This is chosen so that we
+/// will index strings that people will do string comparisons like
+/// `=` or `!=` on; if text longer than this is stored in a String attribute
+/// it is highly unlikely that they will be used for exact string operations.
+/// This also makes sure that we do not put strings into a BTree index that's
+/// bigger than Postgres' limit on such strings which is about 2k
+pub const STRING_PREFIX_SIZE: usize = 256;
+pub const BYTE_ARRAY_PREFIX_SIZE: usize = 64;
+
+lazy_static! {
+    static ref STATEMENT_TIMEOUT: Option<String> = ENV_VARS
+        .graphql
+        .sql_statement_timeout
+        .map(|duration| format!("set local statement_timeout={}", duration.as_millis()));
+}
 
 /// A string we use as a SQL name for a table or column. The important thing
 /// is that SQL names are snake cased. Using this type makes it easier to
@@ -54,7 +96,7 @@ use crate::entities::STRING_PREFIX_SIZE;
 /// Postgres, we would create the same table twice. We consider this case
 /// to be pathological and so unlikely in practice that we do not try to work
 /// around it in the application.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Hash, Ord)]
 pub struct SqlName(String);
 
 impl SqlName {
@@ -103,8 +145,8 @@ impl SqlName {
         SqlName(s)
     }
 
-    pub fn qualified_name(schema: &str, name: &SqlName) -> Self {
-        SqlName(format!("\"{}\".\"{}\"", schema, name.as_str()))
+    pub fn qualified_name(namespace: &Namespace, name: &SqlName) -> Self {
+        SqlName(format!("\"{}\".\"{}\"", namespace, name.as_str()))
     }
 }
 
@@ -126,6 +168,24 @@ impl fmt::Display for SqlName {
     }
 }
 
+impl Borrow<str> for &SqlName {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl FromSql<Text, Pg> for SqlName {
+    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+        <String as FromSql<Text, Pg>>::from_sql(bytes).map(|s| SqlName::verbatim(s))
+    }
+}
+
+impl ToSql<Text, Pg> for SqlName {
+    fn to_sql<W: std::io::Write>(&self, out: &mut Output<W, Pg>) -> diesel::serialize::Result {
+        <String as ToSql<Text, Pg>>::to_sql(&self.0, out)
+    }
+}
+
 /// The SQL type to use for GraphQL ID properties. We support
 /// strings and byte arrays
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -134,12 +194,21 @@ pub(crate) enum IdType {
     Bytes,
 }
 
+impl IdType {
+    pub fn sql_type(&self) -> &str {
+        match self {
+            IdType::String => "text",
+            IdType::Bytes => "bytea",
+        }
+    }
+}
+
 impl TryFrom<&s::ObjectType> for IdType {
     type Error = StoreError;
 
     fn try_from(obj_type: &s::ObjectType) -> Result<Self, Self::Error> {
         let pk = obj_type
-            .field(&PRIMARY_KEY_COLUMN.to_owned())
+            .field(PRIMARY_KEY_COLUMN)
             .expect("Each ObjectType has an `id` field");
         Self::try_from(&pk.field_type)
     }
@@ -154,7 +223,7 @@ impl TryFrom<&s::Type> for IdType {
         match ValueType::from_str(name)? {
             ValueType::String => Ok(IdType::String),
             ValueType::Bytes => Ok(IdType::Bytes),
-            _ => Err(format_err!(
+            _ => Err(anyhow!(
                 "The `id` field has type `{}` but only `String`, `Bytes`, and `ID` are allowed",
                 &name
             )
@@ -163,16 +232,16 @@ impl TryFrom<&s::Type> for IdType {
     }
 }
 
-type IdTypeMap = HashMap<String, IdType>;
+type IdTypeMap = HashMap<EntityType, IdType>;
 
 type EnumMap = BTreeMap<String, Arc<BTreeSet<String>>>;
 
 #[derive(Debug, Clone)]
 pub struct Layout {
+    /// Details of where the subgraph is stored
+    pub site: Arc<Site>,
     /// Maps the GraphQL name of a type to the relational table
-    pub tables: HashMap<String, Arc<Table>>,
-    /// The subgraph id
-    pub subgraph: SubgraphDeploymentId,
+    pub tables: HashMap<EntityType, Arc<Table>>,
     /// The database schema for this subgraph
     pub catalog: Catalog,
     /// Enums defined in the schema and their possible values. The names
@@ -180,20 +249,23 @@ pub struct Layout {
     pub enums: EnumMap,
     /// The query to count all entities
     pub count_query: String,
+    /// How many blocks of history the subgraph should keep
+    pub history_blocks: BlockNumber,
+
+    pub input_schema: InputSchema,
 }
 
 impl Layout {
     /// Generate a layout for a relational schema for entities in the
     /// GraphQL schema `schema`. The name of the database schema in which
-    /// the subgraph's tables live is in `schema`.
+    /// the subgraph's tables live is in `site`.
     pub fn new(
-        schema: &Schema,
+        site: Arc<Site>,
+        schema: &InputSchema,
         catalog: Catalog,
-        create_proof_of_indexing: bool,
     ) -> Result<Self, StoreError> {
         // Extract enum types
         let enums: EnumMap = schema
-            .document
             .get_enum_definitions()
             .iter()
             .map(
@@ -205,7 +277,7 @@ impl Layout {
                             enum_type
                                 .values
                                 .iter()
-                                .map(|value| value.name.to_owned())
+                                .map(|value| value.name.clone())
                                 .collect::<BTreeSet<_>>(),
                         ),
                     ))
@@ -215,7 +287,6 @@ impl Layout {
 
         // List of all object types that are not __SCHEMA__
         let object_types = schema
-            .document
             .get_object_type_definitions()
             .into_iter()
             .filter(|obj_type| obj_type.name != SCHEMA_TYPE_NAME)
@@ -223,14 +294,14 @@ impl Layout {
 
         // For interfaces, check that all implementors use the same IdType
         // and build a list of name/IdType pairs
-        let id_types_for_interface = schema.types_for_interface.iter().map(|(interface, types)| {
+        let id_types_for_interface = schema.interface_types().iter().map(|(interface, types)| {
             types
                 .iter()
-                .map(|obj_type| IdType::try_from(obj_type))
+                .map(IdType::try_from)
                 .collect::<Result<HashSet<_>, _>>()
                 .and_then(move |types| {
                     if types.len() > 1 {
-                        Err(format_err!(
+                        Err(anyhow!(
                             "The implementations of interface \
                             `{}` use different types for the `id` field",
                             interface
@@ -239,8 +310,9 @@ impl Layout {
                     } else {
                         // For interfaces that are not implemented at all, pretend
                         // they have a String `id` field
+                        // see also: id-type-for-unimplemented-interfaces
                         let id_type = types.iter().next().cloned().unwrap_or(IdType::String);
-                        Ok((interface.to_owned(), id_type))
+                        Ok((interface.clone(), id_type))
                     }
                 })
         });
@@ -249,7 +321,7 @@ impl Layout {
         // and interfaces in the schema
         let id_types = object_types
             .iter()
-            .map(|obj_type| IdType::try_from(*obj_type).map(|t| (obj_type.name.to_owned(), t)))
+            .map(|obj_type| IdType::try_from(*obj_type).map(|t| (EntityType::from(*obj_type), t)))
             .chain(id_types_for_interface)
             .collect::<Result<IdTypeMap, _>>()?;
 
@@ -261,26 +333,38 @@ impl Layout {
                 Table::new(
                     obj_type,
                     &catalog,
-                    Schema::entity_fulltext_definitions(&obj_type.name, &schema.document),
+                    schema
+                        .entity_fulltext_definitions(&obj_type.name)
+                        .map_err(|_| StoreError::FulltextSearchNonDeterministic)?,
                     &enums,
                     &id_types,
                     i as u32,
+                    catalog
+                        .entities_with_causality_region
+                        .contains(&EntityType::from(*obj_type)),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if create_proof_of_indexing {
+        if catalog.use_poi {
             tables.push(Self::make_poi_table(&catalog, tables.len()))
         }
 
-        let tables: Vec<_> = tables.into_iter().map(|table| Arc::new(table)).collect();
+        let tables: Vec<_> = tables.into_iter().map(Arc::new).collect();
 
         let count_query = tables
             .iter()
             .map(|table| {
-                format!(
-                    "select count(*) from \"{}\".\"{}\" where upper_inf(block_range)",
-                    &catalog.schema, table.name
-                )
+                if table.immutable {
+                    format!(
+                        "select count(*) from \"{}\".\"{}\"",
+                        &catalog.site.namespace, table.name
+                    )
+                } else {
+                    format!(
+                        "select count(*) from \"{}\".\"{}\" where block_range @> {}",
+                        &catalog.site.namespace, table.name, BLOCK_NUMBER_MAX
+                    )
+                }
             })
             .collect::<Vec<_>>()
             .join("\nunion all\n");
@@ -294,11 +378,13 @@ impl Layout {
             });
 
         Ok(Layout {
-            subgraph: schema.id.clone(),
+            site,
             catalog,
             tables,
             enums,
             count_query,
+            history_blocks: i32::MAX,
+            input_schema: schema.cheap_clone(),
         })
     }
 
@@ -306,18 +392,19 @@ impl Layout {
         let table_name = SqlName::verbatim(POI_TABLE.to_owned());
         Table {
             object: POI_OBJECT.to_owned(),
-            qualified_name: SqlName::qualified_name(&catalog.schema, &table_name),
+            qualified_name: SqlName::qualified_name(&catalog.site.namespace, &table_name),
             name: table_name,
             columns: vec![
                 Column {
-                    name: SqlName::from("digest"),
-                    field: "digest".to_owned(),
+                    name: SqlName::from(POI_DIGEST.as_str()),
+                    field: POI_DIGEST.to_string(),
                     field_type: q::Type::NonNullType(Box::new(q::Type::NamedType(
                         BYTES_SCALAR.to_owned(),
                     ))),
                     column_type: ColumnType::Bytes,
                     fulltext_fields: None,
                     is_reference: false,
+                    use_prefix_comparison: false,
                 },
                 Column {
                     name: SqlName::from(PRIMARY_KEY_COLUMN),
@@ -328,93 +415,37 @@ impl Layout {
                     column_type: ColumnType::String,
                     fulltext_fields: None,
                     is_reference: false,
+                    use_prefix_comparison: false,
                 },
             ],
             /// The position of this table in all the tables for this layout; this
             /// is really only needed for the tests to make the names of indexes
             /// predictable
             position: position as u32,
+            is_account_like: false,
+            immutable: false,
+            has_causality_region: false,
         }
+    }
+
+    pub fn supports_proof_of_indexing(&self) -> bool {
+        self.tables.contains_key(&*POI_OBJECT)
     }
 
     pub fn create_relational_schema(
         conn: &PgConnection,
-        schema: &Schema,
-        schema_name: String,
+        site: Arc<Site>,
+        schema: &InputSchema,
+        entities_with_causality_region: BTreeSet<EntityType>,
     ) -> Result<Layout, StoreError> {
-        let catalog = Catalog::new(conn, schema_name)?;
-        let layout = Self::new(schema, catalog, true)?;
+        let catalog =
+            Catalog::for_creation(conn, site.cheap_clone(), entities_with_causality_region)?;
+        let layout = Self::new(site, schema, catalog)?;
         let sql = layout
             .as_ddl()
-            .map_err(|_| StoreError::Unknown(format_err!("failed to generate DDL for layout")))?;
+            .map_err(|_| StoreError::Unknown(anyhow!("failed to generate DDL for layout")))?;
         conn.batch_execute(&sql)?;
         Ok(layout)
-    }
-
-    pub fn copy_from(
-        &self,
-        logger: &Logger,
-        conn: &PgConnection,
-        base: &Layout,
-        block: EthereumBlockPointer,
-        metadata: &Layout,
-    ) -> Result<(), StoreError> {
-        // This can not be used to copy data to or from the metadata subgraph
-        assert!(!self.subgraph.is_meta());
-        assert!(!base.subgraph.is_meta());
-
-        info!(
-            logger,
-            "Initializing graft by copying data from {} to {}", base.subgraph, self.subgraph
-        );
-
-        // 1. Copy subgraph data
-        // We allow both not copying tables at all from the source, as well
-        // as adding new tables in `self`; we only need to check that tables
-        // that actually need to be copied from the source are compatible
-        // with the corresponding tables in `self`
-        for (dst, src) in self
-            .tables
-            .values()
-            .filter_map(|dst| base.table(&dst.name).map(|src| (dst, src)))
-        {
-            let start = Instant::now();
-            let count = rq::CopyEntityDataQuery::new(dst, src)?.execute(conn)?;
-            info!(logger, "Copied {} {} entities", count, src.object;
-                  "time_ms" => start.elapsed().as_millis());
-        }
-
-        // 2. Copy dynamic data sources and adjust their ID
-        use crate::metadata::dynamic_ethereum_contract_data_source as decds;
-        // Find existing dynamic data sources
-        let start = Instant::now();
-        let dds = decds::table
-            .select(decds::id)
-            .filter(decds::deployment.eq(base.subgraph.as_str()))
-            .load::<String>(conn)?;
-        // Create an equal number of brand new ids
-        let new_dds = (0..dds.len())
-            .map(|_| DynamicEthereumContractDataSourceEntity::make_id())
-            .collect::<Vec<_>>();
-        // Copy the data sources and all their subordinate entities, translating
-        // ids into new ids in the process and attaching them to `self.subgraph`
-        rq::CopyDynamicDataSourceQuery::new(&dds, &new_dds, self.subgraph.as_str())
-            .execute(conn)?;
-        info!(logger, "Copied {} dynamic data sources", dds.len();
-              "time_ms" => start.elapsed().as_millis());
-
-        // 3. Rewind the subgraph. `revert_block` gets rid of everything
-        // including the block passed to it. We want to preserve `block`
-        // and therefore revert `block+1`
-        let start = Instant::now();
-        let block_to_revert: BlockNumber = (block.number + 1)
-            .try_into()
-            .expect("block numbers fit into an i32");
-        self.revert_block(conn, block_to_revert)?;
-        metadata.revert_metadata(conn, &self.subgraph, block_to_revert)?;
-        info!(logger, "Rewound subgraph to block {}", block.number;
-              "time_ms" => start.elapsed().as_millis());
-        Ok(())
     }
 
     /// Determine if it is possible to copy the data of `source` into `self`
@@ -429,45 +460,43 @@ impl Layout {
         self.tables
             .values()
             .filter_map(|dst| base.table(&dst.name).map(|src| (dst, src)))
-            .map(|(dst, src)| dst.can_copy_from(src))
-            .flatten()
+            .flat_map(|(dst, src)| dst.can_copy_from(src))
             .collect()
     }
 
-    /// Generate the DDL for the entire layout, i.e., all `create table`
-    /// and `create index` etc. statements needed in the database schema
-    ///
-    /// See the unit tests at the end of this file for the actual DDL that
-    /// gets generated
-    pub fn as_ddl(&self) -> Result<String, fmt::Error> {
-        let mut out = String::new();
+    /// Import the database schema for this layout from its own database
+    /// shard (in `self.site.shard`) into the database represented by `conn`
+    /// if the schema for this layout does not exist yet
+    pub fn import_schema(&self, conn: &PgConnection) -> Result<(), StoreError> {
+        let make_query = || -> Result<String, fmt::Error> {
+            let nsp = self.site.namespace.as_str();
+            let srvname = ForeignServer::name(&self.site.shard);
 
-        // Output enums first
-        for (name, values) in &self.enums {
-            let mut sep = "";
-            let name = SqlName::from(name.as_str());
-            write!(
-                out,
-                "create type {}.{}\n    as enum (",
-                self.catalog.schema,
-                name.quoted()
+            let mut query = String::new();
+            writeln!(query, "create schema {};", nsp)?;
+            // Postgres does not import enums. We recreate them in the target
+            // database, otherwise importing tables that use them fails
+            self.write_enum_ddl(&mut query)?;
+            writeln!(
+                query,
+                "import foreign schema {nsp} from server {srvname} into {nsp}",
+                nsp = nsp,
+                srvname = srvname
             )?;
-            for value in values.iter() {
-                write!(out, "{}'{}'", sep, value)?;
-                sep = ", "
-            }
-            writeln!(out, ");")?;
-        }
-        // We sort tables here solely because the unit tests rely on
-        // 'create table' statements appearing in a fixed order
-        let mut tables = self.tables.values().collect::<Vec<_>>();
-        tables.sort_by_key(|table| table.position);
-        // Output 'create table' statements for all tables
-        for table in tables {
-            table.as_ddl(&mut out, self)?;
-        }
+            Ok(query)
+        };
 
-        Ok(out)
+        if !catalog::has_namespace(conn, &self.site.namespace)? {
+            let query = make_query().map_err(|_| {
+                StoreError::Unknown(anyhow!(
+                    "failed to generate SQL to import foreign schema {}",
+                    self.site.namespace
+                ))
+            })?;
+
+            conn.batch_execute(&query)?;
+        }
+        Ok(())
     }
 
     /// Find the table with the provided `name`. The name must exactly match
@@ -479,83 +508,181 @@ impl Layout {
             .map(|rc| rc.as_ref())
     }
 
-    pub fn table_for_entity(&self, entity: &str) -> Result<&Arc<Table>, StoreError> {
+    pub fn table_for_entity(&self, entity: &EntityType) -> Result<&Arc<Table>, StoreError> {
         self.tables
             .get(entity)
-            .ok_or_else(|| StoreError::UnknownTable(entity.to_owned()))
+            .ok_or_else(|| StoreError::UnknownTable(entity.to_string()))
     }
 
     pub fn find(
         &self,
         conn: &PgConnection,
-        entity: &str,
-        id: &str,
+        key: &EntityKey,
         block: BlockNumber,
     ) -> Result<Option<Entity>, StoreError> {
-        let table = self.table_for_entity(entity)?;
-        FindQuery::new(table.as_ref(), id, block)
+        let table = self.table_for_entity(&key.entity_type)?;
+        FindQuery::new(table.as_ref(), key, block)
             .get_result::<EntityData>(conn)
             .optional()?
-            .map(|entity_data| entity_data.to_entity(self))
+            .map(|entity_data| entity_data.deserialize_with_layout(self, None))
             .transpose()
     }
 
+    // An optimization when looking up multiple entities, it will generate a single sql query using `UNION ALL`.
     pub fn find_many(
         &self,
         conn: &PgConnection,
-        ids_for_type: BTreeMap<&str, Vec<&str>>,
+        ids_for_type: &BTreeMap<(EntityType, CausalityRegion), Vec<String>>,
         block: BlockNumber,
-    ) -> Result<BTreeMap<String, Vec<Entity>>, StoreError> {
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        if ids_for_type.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+
         let mut tables = Vec::new();
-        for entity_type in ids_for_type.keys() {
-            tables.push(self.table_for_entity(entity_type)?.as_ref());
+        for (entity_type, cr) in ids_for_type.keys() {
+            tables.push((self.table_for_entity(entity_type)?.as_ref(), *cr));
         }
         let query = FindManyQuery {
-            schema: &self.catalog.schema,
+            _namespace: &self.catalog.site.namespace,
             ids_for_type,
             tables,
             block,
         };
-        let mut entities_for_type: BTreeMap<String, Vec<Entity>> = BTreeMap::new();
+        let mut entities: BTreeMap<EntityKey, Entity> = BTreeMap::new();
         for data in query.load::<EntityData>(conn)? {
-            entities_for_type
-                .entry(data.entity_type())
-                .or_default()
-                .push(data.to_entity(self)?);
+            let entity_type = data.entity_type();
+            let entity_data: Entity = data.deserialize_with_layout(self, None)?;
+
+            let key = EntityKey {
+                entity_type,
+                entity_id: entity_data.id(),
+                causality_region: CausalityRegion::from_entity(&entity_data),
+            };
+            if entities.contains_key(&key) {
+                return Err(constraint_violation!(
+                    "duplicate entity {}[{}] in result set, block = {}",
+                    key.entity_type,
+                    key.entity_id,
+                    block
+                ));
+            } else {
+                entities.insert(key, entity_data);
+            }
         }
-        Ok(entities_for_type)
+        Ok(entities)
     }
 
-    pub fn insert(
+    pub fn find_derived(
         &self,
         conn: &PgConnection,
-        key: &EntityKey,
-        entity: Entity,
+        derived_query: &DerivedEntityQuery,
         block: BlockNumber,
-    ) -> Result<(), StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        let query = InsertQuery::new(table, key, entity, block)?;
-        query.execute(conn)?;
-        Ok(())
+        excluded_keys: &Vec<EntityKey>,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        let table = self.table_for_entity(&derived_query.entity_type)?;
+        let query = FindDerivedQuery::new(table, derived_query, block, excluded_keys);
+
+        let mut entities = BTreeMap::new();
+
+        for data in query.load::<EntityData>(conn)? {
+            let entity_type = data.entity_type();
+            let entity_data: Entity = data.deserialize_with_layout(self, None)?;
+            let key = EntityKey {
+                entity_type,
+                entity_id: entity_data.id(),
+                causality_region: CausalityRegion::from_entity(&entity_data),
+            };
+
+            entities.insert(key, entity_data);
+        }
+        Ok(entities)
     }
 
-    pub fn insert_unversioned(
+    pub fn find_changes(
         &self,
         conn: &PgConnection,
-        key: &EntityKey,
-        entity: Entity,
+        block: BlockNumber,
+    ) -> Result<Vec<EntityOperation>, StoreError> {
+        let mut tables = Vec::new();
+        for table in self.tables.values() {
+            if table.name.as_str() != POI_TABLE {
+                tables.push(&**table);
+            }
+        }
+
+        let inserts_or_updates =
+            FindChangesQuery::new(&self.catalog.site.namespace, &tables[..], block)
+                .load::<EntityData>(conn)?;
+        let deletions =
+            FindPossibleDeletionsQuery::new(&self.catalog.site.namespace, &tables[..], block)
+                .load::<EntityDeletion>(conn)?;
+
+        let mut processed_entities = HashSet::new();
+        let mut changes = Vec::new();
+
+        for entity_data in inserts_or_updates.into_iter() {
+            let entity_type = entity_data.entity_type();
+            let data: Entity = entity_data.deserialize_with_layout(self, None)?;
+            let entity_id = data.id();
+            processed_entities.insert((entity_type.clone(), entity_id.clone()));
+
+            changes.push(EntityOperation::Set {
+                key: EntityKey {
+                    entity_type,
+                    entity_id,
+                    causality_region: CausalityRegion::from_entity(&data),
+                },
+                data,
+            });
+        }
+
+        for del in &deletions {
+            let entity_type = del.entity_type();
+            let entity_id = Word::from(del.id());
+
+            // See the doc comment of `FindPossibleDeletionsQuery` for details
+            // about why this check is necessary.
+            if !processed_entities.contains(&(entity_type.clone(), entity_id.clone())) {
+                changes.push(EntityOperation::Remove {
+                    key: EntityKey {
+                        entity_type,
+                        entity_id,
+                        causality_region: del.causality_region(),
+                    },
+                });
+            }
+        }
+
+        Ok(changes)
+    }
+
+    pub fn insert<'a>(
+        &'a self,
+        conn: &PgConnection,
+        group: &'a RowGroup,
+        stopwatch: &StopwatchMetrics,
     ) -> Result<(), StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        let query = InsertQuery::new(table, key, entity, BLOCK_UNVERSIONED)?;
-        query.execute(conn)?;
+        let table = self.table_for_entity(&group.entity_type)?;
+        let _section = stopwatch.start_section("insert_modification_insert_query");
+
+        // We insert the entities in chunks to make sure each operation does
+        // not exceed the maximum number of bindings allowed in queries
+        let chunk_size = InsertQuery::chunk_size(table);
+        for chunk in group.write_chunks(chunk_size) {
+            // Empty chunks would lead to invalid SQL
+            if !chunk.is_empty() {
+                InsertQuery::new(table, &chunk)?.execute(conn)?;
+            }
+        }
         Ok(())
     }
 
     pub fn conflicting_entity(
         &self,
         conn: &PgConnection,
-        entity_id: &String,
-        entities: Vec<&String>,
+        entity_id: &str,
+        entities: Vec<EntityType>,
     ) -> Result<Option<String>, StoreError> {
         Ok(ConflictingEntityQuery::new(self, entities, entity_id)?
             .load(conn)?
@@ -564,127 +691,196 @@ impl Layout {
     }
 
     /// order is a tuple (attribute, value_type, direction)
-    pub fn query(
+    pub fn query<T: crate::relational_queries::FromEntityData>(
         &self,
         logger: &Logger,
         conn: &PgConnection,
-        collection: EntityCollection,
-        filter: Option<EntityFilter>,
-        order: Option<(String, ValueType, EntityOrder)>,
-        range: EntityRange,
-        block: BlockNumber,
-    ) -> Result<Vec<Entity>, QueryExecutionError> {
+        query: EntityQuery,
+    ) -> Result<(Vec<T>, Trace), QueryExecutionError> {
         fn log_query_timing(
             logger: &Logger,
             query: &FilterQuery,
             elapsed: Duration,
             entity_count: usize,
-        ) {
+            trace: bool,
+        ) -> Trace {
             // 20kB
             const MAXLEN: usize = 20_480;
 
-            if !*graph::log::LOG_SQL_TIMING {
-                return;
+            if !ENV_VARS.log_sql_timing() && !trace {
+                return Trace::None;
             }
 
-            let mut text = debug_query(&query).to_string().replace("\n", " ");
-            // If the query + bind variables is more than MAXLEN, truncate it;
-            // this will happen when queries have very large bind variables
-            // (e.g., long arrays of string ids)
-            if text.len() > MAXLEN {
-                text.truncate(MAXLEN);
-                text.push_str(" ...");
+            let mut text = debug_query(&query).to_string().replace('\n', "\t");
+
+            let trace = if trace {
+                Trace::query(&text, elapsed, entity_count)
+            } else {
+                Trace::None
+            };
+
+            if ENV_VARS.log_sql_timing() {
+                // If the query + bind variables is more than MAXLEN, truncate it;
+                // this will happen when queries have very large bind variables
+                // (e.g., long arrays of string ids)
+                if text.len() > MAXLEN {
+                    text.truncate(MAXLEN);
+                    text.push_str(" ...");
+                }
+                info!(
+                    logger,
+                    "Query timing (SQL)";
+                    "query" => text,
+                    "time_ms" => elapsed.as_millis(),
+                    "entity_count" => entity_count
+                );
             }
-            info!(
-                logger,
-                "Query timing (SQL)";
-                "query" => text,
-                "time_ms" => elapsed.as_millis(),
-                "entity_count" => entity_count
-            );
+            trace
         }
 
-        let filter_collection = FilterCollection::new(&self, collection, filter.as_ref())?;
-        let query = FilterQuery::new(&filter_collection, filter.as_ref(), order, range, block)?;
+        let trace = query.trace;
+
+        let filter_collection =
+            FilterCollection::new(self, query.collection, query.filter.as_ref(), query.block)?;
+        let query = FilterQuery::new(
+            &filter_collection,
+            self,
+            query.filter.as_ref(),
+            query.order,
+            query.range,
+            query.block,
+            query.query_id,
+            &self.site,
+        )?;
+
         let query_clone = query.clone();
 
         let start = Instant::now();
-        let values = query.load::<EntityData>(conn).map_err(|e| {
-            QueryExecutionError::ResolveEntitiesError(format!(
-                "{}, query = {:?}",
-                e,
-                debug_query(&query_clone).to_string()
-            ))
-        })?;
-        log_query_timing(logger, &query_clone, start.elapsed(), values.len());
+        let values = conn
+            .transaction(|| {
+                if let Some(ref timeout_sql) = *STATEMENT_TIMEOUT {
+                    conn.batch_execute(timeout_sql)?;
+                }
+                query.load::<EntityData>(conn)
+            })
+            .map_err(|e| {
+                use diesel::result::DatabaseErrorKind;
+                use diesel::result::Error::*;
+                // Sometimes `debug_query(..)` can't be turned into a
+                // string, e.g., because `walk_ast` for one of its fragments
+                // returns an error. When that happens, avoid a panic from
+                // simply calling `to_string()` on it, and output a string
+                // representation of the `FilterQuery` instead of the SQL
+                let mut query_text = String::new();
+                match write!(query_text, "{}", debug_query(&query_clone)) {
+                    Ok(()) => (),
+                    Err(_) => {
+                        write!(query_text, "{query_clone}").ok();
+                    }
+                };
+                match e {
+                    DatabaseError(DatabaseErrorKind::__Unknown, ref info)
+                        if info.message().starts_with("syntax error in tsquery") =>
+                    {
+                        QueryExecutionError::FulltextQueryInvalidSyntax(info.message().to_string())
+                    }
+                    _ => QueryExecutionError::ResolveEntitiesError(format!(
+                        "{e}, query = {query_text}",
+                    )),
+                }
+            })?;
+        let trace = log_query_timing(logger, &query_clone, start.elapsed(), values.len(), trace);
+
+        let parent_type = filter_collection.parent_type()?.map(ColumnType::from);
         values
             .into_iter()
-            .map(|entity_data| entity_data.to_entity(self).map_err(|e| e.into()))
-            .collect()
+            .map(|entity_data| {
+                entity_data
+                    .deserialize_with_layout(self, parent_type.as_ref())
+                    .map_err(|e| e.into())
+            })
+            .collect::<Result<Vec<T>, _>>()
+            .map(|values| (values, trace))
     }
 
-    pub fn update(
-        &self,
+    pub fn update<'a>(
+        &'a self,
         conn: &PgConnection,
-        key: &EntityKey,
-        entity: Entity,
-        block: BlockNumber,
-    ) -> Result<(), StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        ClampRangeQuery::new(table, key, block).execute(conn)?;
-        let query = InsertQuery::new(table, key, entity, block)?;
-        query.execute(conn)?;
-        Ok(())
-    }
-
-    pub fn update_unversioned(
-        &self,
-        conn: &PgConnection,
-        key: &EntityKey,
-        entity: &Entity,
+        group: &'a RowGroup,
+        stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        let query = UpdateQuery::new(table, key, entity)?;
-        Ok(query.execute(conn)?)
-    }
-
-    pub fn overwrite_unversioned(
-        &self,
-        conn: &PgConnection,
-        key: &EntityKey,
-        mut entity: Entity,
-    ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        // Set any attributes not mentioned in the entity to
-        // their default (NULL)
-        for column in table.columns.iter() {
-            if !entity.contains_key(&column.field) {
-                entity.insert(column.field.clone(), Value::Null);
-            }
+        let table = self.table_for_entity(&group.entity_type)?;
+        if table.immutable && group.has_clamps() {
+            let ids = group.ids().collect::<Vec<_>>().join(", ");
+            return Err(constraint_violation!(
+                "entities of type `{}` can not be updated since they are immutable. Entity ids are [{}]",
+                group.entity_type,
+                ids
+            ));
         }
-        let query = UpdateQuery::new(table, key, &entity)?;
-        Ok(query.execute(conn)?)
+
+        let section = stopwatch.start_section("update_modification_clamp_range_query");
+        for (block, rows) in group.clamps_by_block() {
+            let entity_keys: Vec<&str> = rows.iter().map(|row| row.id().as_str()).collect();
+
+            ClampRangeQuery::new(table, &entity_keys, block)?.execute(conn)?;
+        }
+        section.end();
+
+        let _section = stopwatch.start_section("update_modification_insert_query");
+        let mut count = 0;
+
+        // We insert the entities in chunks to make sure each operation does
+        // not exceed the maximum number of bindings allowed in queries
+        let chunk_size = InsertQuery::chunk_size(table);
+        for chunk in group.write_chunks(chunk_size) {
+            count += InsertQuery::new(table, &chunk)?.execute(conn)?;
+        }
+
+        Ok(count)
     }
 
     pub fn delete(
         &self,
         conn: &PgConnection,
-        key: &EntityKey,
-        block: BlockNumber,
+        group: &RowGroup,
+        stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        Ok(ClampRangeQuery::new(table, key, block).execute(conn)?)
+        if !group.has_clamps() {
+            // Nothing to do
+            return Ok(0);
+        }
+
+        let table = self.table_for_entity(&group.entity_type)?;
+        if table.immutable {
+            return Err(constraint_violation!(
+                "entities of type `{}` can not be deleted since they are immutable. Entity ids are [{}]",
+                table.object, group.ids().join(", ")
+            ));
+        }
+
+        let _section = stopwatch.start_section("delete_modification_clamp_range_query");
+        let mut count = 0;
+        for (block, rows) in group.clamps_by_block() {
+            let ids: Vec<_> = rows.iter().map(|eref| eref.id().as_str()).collect();
+            for chunk in ids.chunks(DELETE_OPERATION_CHUNK_SIZE) {
+                count += ClampRangeQuery::new(table, chunk, block)?.execute(conn)?
+            }
+        }
+        Ok(count)
     }
 
-    pub fn delete_unversioned(
-        &self,
-        conn: &PgConnection,
-        key: &EntityKey,
-    ) -> Result<usize, StoreError> {
-        let table = self.table_for_entity(&key.entity_type)?;
-        Ok(DeleteQuery::new(table, key).execute(conn)?)
+    pub fn truncate_tables(&self, conn: &PgConnection) -> Result<StoreEvent, StoreError> {
+        for table in self.tables.values() {
+            conn.execute(&format!("TRUNCATE TABLE {}", table.qualified_name))?;
+        }
+        Ok(StoreEvent::new(vec![]))
     }
 
+    /// Revert the block with number `block` and all blocks with higher
+    /// numbers. After this operation, only entity versions inserted or
+    /// updated at blocks with numbers strictly lower than `block` will
+    /// remain
     pub fn revert_block(
         &self,
         conn: &PgConnection,
@@ -704,11 +900,15 @@ impl Layout {
             // Make the versions current that existed at `block - 1` but that
             // are not current yet. Those are the ones that were updated or
             // deleted at `block`
-            let unclamped = RevertClampQuery::new(table, block - 1)
-                .get_results(conn)?
-                .into_iter()
-                .map(|data| data.id)
-                .collect::<HashSet<_>>();
+            let unclamped = if table.immutable {
+                HashSet::new()
+            } else {
+                RevertClampQuery::new(table, block - 1)?
+                    .get_results(conn)?
+                    .into_iter()
+                    .map(|data| data.id)
+                    .collect::<HashSet<_>>()
+            };
             // Adjust the entity count; we can tell which operation was
             // initially performed by
             //   id in (unset - unclamped)  => insert (we now deleted)
@@ -721,19 +921,15 @@ impl Layout {
             let deleted = removed
                 .into_iter()
                 .filter(|id| !unclamped.contains(id))
-                .map(|id| EntityChange {
-                    subgraph_id: self.subgraph.clone(),
+                .map(|_| EntityChange::Data {
+                    subgraph_id: self.site.deployment.clone(),
                     entity_type: table.object.clone(),
-                    entity_id: id,
-                    operation: EntityChangeOperation::Removed,
                 });
             changes.extend(deleted);
             // EntityChange for versions that we just updated or inserted
-            let set = unclamped.into_iter().map(|id| EntityChange {
-                subgraph_id: self.subgraph.clone(),
+            let set = unclamped.into_iter().map(|_| EntityChange::Data {
+                subgraph_id: self.site.deployment.clone(),
                 entity_type: table.object.clone(),
-                entity_id: id,
-                operation: EntityChangeOperation::Set,
             });
             changes.extend(set);
         }
@@ -741,75 +937,64 @@ impl Layout {
     }
 
     /// Revert the metadata (dynamic data sources and related entities) for
-    /// the given `subgraph`. This function can only be called on the `Layout`
-    /// for the metadata subgraph.
+    /// the given `subgraph`.
     ///
     /// For metadata, reversion always means deletion since the metadata that
     /// is subject to reversion is only ever created but never updated
     pub fn revert_metadata(
-        &self,
         conn: &PgConnection,
-        subgraph: &SubgraphDeploymentId,
+        site: &Site,
         block: BlockNumber,
-    ) -> Result<StoreEvent, StoreError> {
-        assert!(self.subgraph.is_meta());
-        const DDS: &str = "DynamicEthereumContractDataSource";
+    ) -> Result<(), StoreError> {
+        crate::dynds::revert(conn, site, block)?;
+        crate::deployment::revert_subgraph_errors(conn, &site.deployment, block)?;
 
-        // Delete dynamic data sources for this subgraph at the given block
-        // and get their id's
-        let dds = DeleteDynamicDataSourcesQuery::new(subgraph.as_str(), block)
-            .get_results(conn)?
-            .into_iter()
-            .map(|data| data.id)
-            .collect::<Vec<_>>();
+        Ok(())
+    }
 
-        // Calculate how long id's are and make sure they have all the same length
-        let prefix_len = dds.iter().map(|id| id.len()).min();
-        assert_eq!(prefix_len, dds.iter().map(|id| id.len()).max());
-        let prefix_len = prefix_len.unwrap_or(0) as i32;
+    pub fn is_cacheable(&self) -> bool {
+        // This would be false if we still needed to migrate the Layout, but
+        // since there are no migrations in the code right now, it is always
+        // safe to cache a Layout
+        true
+    }
 
-        let mut changes: Vec<EntityChange> = dds
-            .iter()
-            .map(|id| EntityChange {
-                subgraph_id: self.subgraph.clone(),
-                entity_type: DDS.to_owned(),
-                entity_id: id.to_owned(),
-                operation: EntityChangeOperation::Removed,
-            })
+    /// Update the layout with the latest information from the database; an
+    /// update can only change the `is_account_like` flag for tables, the
+    /// layout's site, or the `history_blocks`. If no update is needed, just
+    /// return `self`.
+    ///
+    /// This is tied closely to how the `LayoutCache` works and called from
+    /// it right after creating a `Layout`, and periodically to update the
+    /// `Layout` in case changes were made
+    fn refresh(
+        self: Arc<Self>,
+        conn: &PgConnection,
+        site: Arc<Site>,
+    ) -> Result<Arc<Self>, StoreError> {
+        let account_like = crate::catalog::account_like(conn, &self.site)?;
+        let history_blocks = deployment::history_blocks(conn, &self.site)?;
+
+        let is_account_like = { |table: &Table| account_like.contains(table.name.as_str()) };
+
+        let changed_tables: Vec<_> = self
+            .tables
+            .values()
+            .filter(|table| table.is_account_like != is_account_like(table.as_ref()))
             .collect();
-
-        if !dds.is_empty() {
-            // Remove subordinate entities for the dynamic data sources from
-            // the various metadata tables. We do not need to consider the
-            // table for dynamic data sources, not any table whose name starts
-            // with 'Subgraph'. Since the set of metadata entities might change
-            // in the future, it is safer to exclude entity types that we know
-            // do not contain data of interest rather than check for inclusion
-            // in a whitelist, as it should generally be safe to do the deletion
-            // on all metadata tables
-            //
-            // This code is far from ideal since it relies on a few unenforceable
-            // assumptions, most importantly, that the id of any entity that
-            // belongs to a dynmaic data source starts with the id of that data
-            // source
-            for table in self
-                .tables
-                .values()
-                .filter(|table| table.object != DDS && !table.object.starts_with("Subgraph"))
-            {
-                let deleted = DeleteByPrefixQuery::new(table, &dds, prefix_len)
-                    .get_results(conn)?
-                    .into_iter()
-                    .map(|data| EntityChange {
-                        subgraph_id: self.subgraph.clone(),
-                        entity_type: table.object.clone(),
-                        entity_id: data.id,
-                        operation: EntityChangeOperation::Removed,
-                    });
-                changes.extend(deleted);
-            }
+        if changed_tables.is_empty() && site == self.site && history_blocks == self.history_blocks {
+            return Ok(self);
         }
-        Ok(StoreEvent::new(changes))
+
+        let mut layout = (*self).clone();
+        for table in changed_tables.into_iter() {
+            let mut table = (*table.as_ref()).clone();
+            table.is_account_like = is_account_like(&table);
+            layout.tables.insert(table.object.clone(), Arc::new(table));
+        }
+        layout.site = site;
+        layout.history_blocks = history_blocks;
+        Ok(Arc::new(layout))
     }
 }
 
@@ -845,18 +1030,16 @@ pub enum ColumnType {
     BigInt,
     Bytes,
     Int,
+    Int8,
     String,
     TSVector(FulltextConfig),
     Enum(EnumType),
-    /// A `bytea` in SQL, represented as a ValueType::String; this is
-    /// used for `id` columns of type `Bytes`
-    BytesId,
 }
 
 impl From<IdType> for ColumnType {
     fn from(id_type: IdType) -> Self {
         match id_type {
-            IdType::Bytes => ColumnType::BytesId,
+            IdType::Bytes => ColumnType::Bytes,
             IdType::String => ColumnType::String,
         }
     }
@@ -873,16 +1056,16 @@ impl ColumnType {
         let name = named_type(field_type);
 
         // See if its an object type defined in the schema
-        if let Some(id_type) = id_types.get(name) {
-            return Ok(id_type.clone().into());
+        if let Some(id_type) = id_types.get(&EntityType::new(name.to_string())) {
+            return Ok((*id_type).into());
         }
 
         // Check if it's an enum, and if it is, return an appropriate
         // ColumnType::Enum
-        if let Some(values) = enums.get(&*name) {
+        if let Some(values) = enums.get(name) {
             // We do things this convoluted way to make sure field_type gets
             // snakecased, but the `.` must stay a `.`
-            let name = SqlName::qualified_name(&catalog.schema, &SqlName::from(name));
+            let name = SqlName::qualified_name(&catalog.site.namespace, &SqlName::from(name));
             if is_existing_text_column {
                 // We used to have a bug where columns that should have really
                 // been of an enum type were created as text columns. To make
@@ -905,10 +1088,8 @@ impl ColumnType {
             ValueType::BigInt => Ok(ColumnType::BigInt),
             ValueType::Bytes => Ok(ColumnType::Bytes),
             ValueType::Int => Ok(ColumnType::Int),
+            ValueType::Int8 => Ok(ColumnType::Int8),
             ValueType::String => Ok(ColumnType::String),
-            ValueType::List => Err(StoreError::Unknown(format_err!(
-                "can not convert ValueType::List to ColumnType"
-            ))),
         }
     }
 
@@ -919,10 +1100,10 @@ impl ColumnType {
             ColumnType::BigInt => "numeric",
             ColumnType::Bytes => "bytea",
             ColumnType::Int => "integer",
+            ColumnType::Int8 => "int8",
             ColumnType::String => "text",
             ColumnType::TSVector(_) => "tsvector",
             ColumnType::Enum(enum_type) => enum_type.name.as_str(),
-            ColumnType::BytesId => "bytea",
         }
     }
 
@@ -931,7 +1112,7 @@ impl ColumnType {
     pub(crate) fn id_type(&self) -> IdType {
         match self {
             ColumnType::String => IdType::String,
-            ColumnType::BytesId => IdType::Bytes,
+            ColumnType::Bytes => IdType::Bytes,
             _ => unreachable!(
                 "only String and BytesId are allowed as primary keys but not {:?}",
                 self
@@ -948,6 +1129,9 @@ pub struct Column {
     pub column_type: ColumnType,
     pub fulltext_fields: Option<HashSet<String>>,
     is_reference: bool,
+    /// Whether to use a prefix of the column for comparisons and index
+    /// creation, or column values in their entirety
+    pub use_prefix_comparison: bool,
 }
 
 impl Column {
@@ -958,7 +1142,7 @@ impl Column {
         enums: &EnumMap,
         id_types: &IdTypeMap,
     ) -> Result<Column, StoreError> {
-        SqlName::check_valid_identifier(&*field.name, "attribute")?;
+        SqlName::check_valid_identifier(&field.name, "attribute")?;
 
         let sql_name = SqlName::from(&*field.name);
         let is_reference =
@@ -976,6 +1160,25 @@ impl Column {
                 is_existing_text_column,
             )?
         };
+        let is_primary_key = sql_name.as_str() == PRIMARY_KEY_COLUMN;
+
+        // When a column has arbitrary size, we only index a prefix of the
+        // column to avoid errors caused by inserting values that are too
+        // large for the index.
+        //
+        // Since we already have installations where `Bytes` columns had
+        // been indexed in their entirety, we remember if a specific
+        // subgraph indexes that, or just a prefix of `Bytes` columns. Query
+        // generation needs to match how these columns are indexed, and we
+        // therefore use that remembered value from `catalog` to determine
+        // if we should use queries for prefixes or for the entire value.
+        // see: attr-bytea-prefix
+        let use_prefix_comparison = !is_primary_key
+            && !is_reference
+            && !field.field_type.is_list()
+            && (column_type == ColumnType::String
+                || (column_type == ColumnType::Bytes && catalog.use_bytea_prefix));
+
         Ok(Column {
             name: sql_name,
             field: field.name.clone(),
@@ -983,6 +1186,7 @@ impl Column {
             field_type: field.field_type.clone(),
             fulltext_fields: None,
             is_reference,
+            use_prefix_comparison,
         })
     }
 
@@ -993,10 +1197,11 @@ impl Column {
         Ok(Column {
             name: sql_name,
             field: def.name.to_string(),
-            field_type: q::Type::NamedType(String::from("fulltext".to_string())),
+            field_type: q::Type::NamedType("fulltext".to_string()),
             column_type: ColumnType::TSVector(def.config.clone()),
             fulltext_fields: Some(def.included_fields.clone()),
             is_reference: false,
+            use_prefix_comparison: false,
         })
     }
 
@@ -1015,24 +1220,11 @@ impl Column {
     }
 
     pub fn is_list(&self) -> bool {
-        fn is_list(field_type: &q::Type) -> bool {
-            use q::Type::*;
-
-            match field_type {
-                ListType(_) => true,
-                NonNullType(inner) => is_list(inner),
-                NamedType(_) => false,
-            }
-        }
-        is_list(&self.field_type)
+        self.field_type.is_list()
     }
 
     pub fn is_enum(&self) -> bool {
-        if let ColumnType::Enum(_) = self.column_type {
-            true
-        } else {
-            false
-        }
+        matches!(self.column_type, ColumnType::Enum(_))
     }
 
     pub fn is_fulltext(&self) -> bool {
@@ -1047,14 +1239,7 @@ impl Column {
         self.name.as_str() == PRIMARY_KEY_COLUMN
     }
 
-    /// Return `true` if this column stores user-supplied text. Such
-    /// columns may contain very large values and need to be handled
-    /// specially for indexing
-    pub fn is_text(&self) -> bool {
-        named_type(&self.field_type) == "String" && !self.is_list()
-    }
-
-    pub fn is_assignable_from(&self, source: &Self, object: &str) -> Option<String> {
+    pub fn is_assignable_from(&self, source: &Self, object: &EntityType) -> Option<String> {
         if !self.is_nullable() && source.is_nullable() {
             Some(format!(
                 "The attribute {}.{} is non-nullable, \
@@ -1081,23 +1266,6 @@ impl Column {
             None
         }
     }
-
-    /// Generate the DDL for one column, i.e. the part of a `create table`
-    /// statement for this column.
-    ///
-    /// See the unit tests at the end of this file for the actual DDL that
-    /// gets generated
-    fn as_ddl(&self, out: &mut String) -> fmt::Result {
-        write!(out, "    ")?;
-        write!(out, "{:20} {}", self.name.quoted(), self.sql_type())?;
-        if self.is_list() {
-            write!(out, "[]")?;
-        }
-        if self.is_primary_key() || !self.is_nullable() {
-            write!(out, " not null")?;
-        }
-        Ok(())
-    }
 }
 
 /// The name for the primary key column of a table; hardcoded for now
@@ -1107,10 +1275,10 @@ pub(crate) const PRIMARY_KEY_COLUMN: &str = "id";
 /// synthetic primary key. This is the name of the column we use.
 pub(crate) const VID_COLUMN: &str = "vid";
 
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub struct Table {
     /// The name of the GraphQL object type ('Thing')
-    pub object: s::Name,
+    pub object: EntityType,
     /// The name of the database table for this type ('thing'), snakecased
     /// version of `object`
     pub name: SqlName,
@@ -1120,10 +1288,24 @@ pub struct Table {
     pub qualified_name: SqlName,
 
     pub columns: Vec<Column>,
+
+    /// This kind of entity behaves like an account in that it has a low
+    /// ratio of distinct entities to overall number of rows because
+    /// entities are updated frequently on average
+    pub is_account_like: bool,
+
     /// The position of this table in all the tables for this layout; this
     /// is really only needed for the tests to make the names of indexes
     /// predictable
     position: u32,
+
+    /// Entities in this table are immutable, i.e., will never be updated or
+    /// deleted
+    pub(crate) immutable: bool,
+
+    /// Whether this table has an explicit `causality_region` column. If `false`, then the column is
+    /// not present and the causality region for all rows is implicitly `0` (equivalent to CasualityRegion::ONCHAIN).
+    pub(crate) has_causality_region: bool,
 }
 
 impl Table {
@@ -1134,26 +1316,52 @@ impl Table {
         enums: &EnumMap,
         id_types: &IdTypeMap,
         position: u32,
+        has_causality_region: bool,
     ) -> Result<Table, StoreError> {
-        SqlName::check_valid_identifier(&*defn.name, "object")?;
+        SqlName::check_valid_identifier(&defn.name, "object")?;
 
         let table_name = SqlName::from(&*defn.name);
         let columns = defn
             .fields
             .iter()
-            .filter(|field| !derived_column(field))
+            .filter(|field| !field.is_derived())
             .map(|field| Column::new(&table_name, field, catalog, enums, id_types))
-            .chain(fulltexts.iter().map(|def| Column::new_fulltext(def)))
+            .chain(fulltexts.iter().map(Column::new_fulltext))
             .collect::<Result<Vec<Column>, StoreError>>()?;
+        let qualified_name = SqlName::qualified_name(&catalog.site.namespace, &table_name);
+        let immutable = defn.is_immutable();
 
         let table = Table {
-            object: defn.name.clone(),
-            name: table_name.clone(),
-            qualified_name: SqlName::qualified_name(&catalog.schema, &table_name),
+            object: EntityType::from(defn),
+            name: table_name,
+            qualified_name,
+            // Default `is_account_like` to `false`; the caller should call
+            // `refresh` after constructing the layout, but that requires a
+            // db connection, which we don't have at this point.
+            is_account_like: false,
             columns,
             position,
+            immutable,
+            has_causality_region,
         };
         Ok(table)
+    }
+
+    /// Create a table that is like `self` except that its name in the
+    /// database is based on `namespace` and `name`
+    pub fn new_like(&self, namespace: &Namespace, name: &SqlName) -> Arc<Table> {
+        let other = Table {
+            object: self.object.clone(),
+            name: name.clone(),
+            qualified_name: SqlName::qualified_name(namespace, name),
+            columns: self.columns.clone(),
+            is_account_like: self.is_account_like,
+            position: self.position,
+            immutable: self.immutable,
+            has_causality_region: self.has_causality_region,
+        };
+
+        Arc::new(other)
     }
 
     /// Find the column `name` in this table. The name must be in snake case,
@@ -1173,7 +1381,7 @@ impl Table {
     pub fn column_for_field(&self, field: &str) -> Result<&Column, StoreError> {
         self.columns
             .iter()
-            .find(|column| &column.field == field)
+            .find(|column| column.field == field)
             .ok_or_else(|| StoreError::UnknownField(field.to_string()))
     }
 
@@ -1204,99 +1412,19 @@ impl Table {
             .expect("every table has a primary key")
     }
 
-    /// Generate the DDL for one table, i.e. one `create table` statement
-    /// and all `create index` statements for the table's columns
-    ///
-    /// See the unit tests at the end of this file for the actual DDL that
-    /// gets generated
-    fn as_ddl(&self, out: &mut String, layout: &Layout) -> fmt::Result {
-        writeln!(
-            out,
-            "create table {}.{} (",
-            layout.catalog.schema,
-            self.name.quoted()
-        )?;
-        for column in self.columns.iter() {
-            write!(out, "    ")?;
-            column.as_ddl(out)?;
-            writeln!(out, ",")?;
+    pub(crate) fn analyze(&self, conn: &PgConnection) -> Result<(), StoreError> {
+        let table_name = &self.qualified_name;
+        let sql = format!("analyze {table_name}");
+        conn.execute(&sql)?;
+        Ok(())
+    }
+
+    pub(crate) fn block_column(&self) -> &SqlName {
+        if self.immutable {
+            &crate::block_range::BLOCK_COLUMN_SQL
+        } else {
+            &crate::block_range::BLOCK_RANGE_COLUMN_SQL
         }
-        // Add block_range column and constraint
-        write!(
-            out,
-            "\n        {vid}                  bigserial primary key,\
-             \n        {block_range}          int4range not null,
-        exclude using gist   (id with =, {block_range} with &&)\n);\n",
-            vid = VID_COLUMN,
-            block_range = BLOCK_RANGE_COLUMN
-        )?;
-
-        // Add a BRIN index on the block_range bounds to exploit the fact
-        // that block ranges closely correlate with where in a table an
-        // entity appears physically. This index is incredibly efficient for
-        // reverts where we look for very recent blocks, so that this index
-        // is highly selective. See https://github.com/graphprotocol/graph-node/issues/1415#issuecomment-630520713
-        // for details on one experiment.
-        //
-        // We do not index the `block_range` as a whole, but rather the lower
-        // and upper bound separately, since experimentation has shown that
-        // Postgres will not use the index on `block_range` for clauses like
-        // `block_range @> $block` but rather falls back to a full table scan.
-        //
-        // We also make sure that we do not put `NULL` in the index for
-        // the upper bound since nulls can not be compared to anything and
-        // will make the index less effective.
-        //
-        // To make the index usable, queries need to have clauses using
-        // `lower(block_range)` and `coalesce(..)` verbatim.
-        //
-        // We also index `vid` as that correlates with the order in which
-        // entities are stored.
-        write!(out,"create index brin_{table_name}\n    \
-                    on {schema_name}.{table_name}\n \
-                       using brin(lower(block_range), coalesce(upper(block_range), {block_max}), vid);\n",
-            table_name = self.name,
-            schema_name = layout.catalog.schema,
-            block_max = BLOCK_NUMBER_MAX)?;
-
-        // Create indexes. Skip columns whose type is an array of enum,
-        // since there is no good way to index them with Postgres 9.6.
-        // Once we move to Postgres 11, we can enable that
-        // (tracked in graph-node issue #1330)
-        for (i, column) in self
-            .columns
-            .iter()
-            .filter(|col| !(col.is_list() && col.is_enum()))
-            .enumerate()
-        {
-            // Attributes that are plain strings are indexed with a BTree; but
-            // they can be too large for Postgres' limit on values that can go
-            // into a BTree. For those attributes, only index the first
-            // STRING_PREFIX_SIZE characters
-            let index_expr = if column.is_text() {
-                format!("left({}, {})", column.name.quoted(), STRING_PREFIX_SIZE)
-            } else {
-                column.name.quoted()
-            };
-
-            let method = if column.is_list() || column.is_fulltext() {
-                "gin"
-            } else {
-                "btree"
-            };
-            write!(
-                out,
-                "create index attr_{table_index}_{column_index}_{table_name}_{column_name}\n    on {schema_name}.\"{table_name}\" using {method}({index_expr});\n",
-                table_index = self.position,
-                table_name = self.name,
-                column_index = i,
-                column_name = column.name,
-                schema_name = layout.catalog.schema,
-                method = method,
-                index_expr = index_expr,
-            )?;
-        }
-        writeln!(out)
     }
 }
 
@@ -1310,526 +1438,135 @@ fn named_type(field_type: &q::Type) -> &str {
     }
 }
 
-fn derived_column(field: &s::Field) -> bool {
-    field
-        .directives
-        .iter()
-        .any(|dir| dir.name == s::Name::from("derivedFrom"))
-}
-
 fn is_object_type(field_type: &q::Type, enums: &EnumMap) -> bool {
     let name = named_type(field_type);
 
-    !enums.contains_key(&*name) && !ValueType::is_scalar(name)
+    !enums.contains_key(name) && !ValueType::is_scalar(name)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[derive(Clone)]
+struct CacheEntry {
+    value: Arc<Layout>,
+    expires: Instant,
+}
 
-    const ID_TYPE: ColumnType = ColumnType::String;
+/// Cache layouts for some time and refresh them when they expire.
+/// Refreshing happens one at a time, and the cache makes sure we minimize
+/// blocking while a refresh happens, favoring using an expired layout over
+/// a refreshed one.
+pub struct LayoutCache {
+    entries: Mutex<HashMap<DeploymentHash, CacheEntry>>,
+    ttl: Duration,
+    /// Use this so that we only refresh one layout at any given time to
+    /// avoid refreshing the same layout multiple times
+    refresh: Mutex<()>,
+}
 
-    fn test_layout(gql: &str) -> Layout {
-        let subgraph = SubgraphDeploymentId::new("subgraph").unwrap();
-        let schema = Schema::parse(gql, subgraph).expect("Test schema invalid");
-        let catalog = Catalog::make_empty("rel".to_owned()).expect("Can not create catalog");
-        Layout::new(&schema, catalog, false).expect("Failed to construct Layout")
-    }
-
-    #[test]
-    fn table_is_sane() {
-        let layout = test_layout(THING_GQL);
-        let table = layout
-            .table(&"thing".into())
-            .expect("failed to get 'thing' table");
-        assert_eq!(SqlName::from("thing"), table.name);
-        assert_eq!("Thing", table.object);
-
-        let id = table
-            .column(&PRIMARY_KEY_COLUMN.into())
-            .expect("failed to get 'id' column for 'thing' table");
-        assert_eq!(ID_TYPE, id.column_type);
-        assert!(!id.is_nullable());
-        assert!(!id.is_list());
-
-        let big_thing = table
-            .column(&"big_thing".into())
-            .expect("failed to get 'big_thing' column for 'thing' table");
-        assert_eq!(ID_TYPE, big_thing.column_type);
-        assert!(!big_thing.is_nullable());
-        // Field lookup happens by the SQL name, not the GraphQL name
-        let bad_sql_name = SqlName("bigThing".to_owned());
-        assert!(table.column(&bad_sql_name).is_none());
-    }
-
-    #[test]
-    fn generate_ddl() {
-        let layout = test_layout(THING_GQL);
-        let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(THING_DDL, sql);
-
-        let layout = test_layout(MUSIC_GQL);
-        let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(MUSIC_DDL, sql);
-
-        let layout = test_layout(FOREST_GQL);
-        let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(FOREST_DDL, sql);
-
-        let layout = test_layout(FULLTEXT_GQL);
-        let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(FULLTEXT_DDL, sql);
-
-        let layout = test_layout(FORWARD_ENUM_GQL);
-        let sql = layout.as_ddl().expect("Failed to generate DDL");
-        assert_eq!(FORWARD_ENUM_SQL, sql);
-    }
-
-    #[test]
-    fn forward_enum() {
-        let layout = test_layout(FORWARD_ENUM_GQL);
-        let table = layout
-            .table(&SqlName::from("thing"))
-            .expect("thing table exists");
-        let column = table
-            .column(&SqlName::from("orientation"))
-            .expect("orientation column exists");
-        assert!(column.is_enum());
-    }
-
-    #[test]
-    fn can_copy_from() {
-        let source = test_layout(THING_GQL);
-        // We can always copy from an identical layout
-        assert!(source.can_copy_from(&source).is_empty());
-
-        // We allow leaving out and adding types, and leaving out attributes
-        // of existing types
-        let dest = test_layout("type Scalar { id: ID } type Other { id: ID, int: Int! }");
-        assert!(dest.can_copy_from(&source).is_empty());
-
-        // We allow making a non-nullable attribute nullable
-        let dest = test_layout("type Thing { id: ID! }");
-        assert!(dest.can_copy_from(&source).is_empty());
-
-        // We can not turn a non-nullable attribute into a nullable attribute
-        let dest = test_layout("type Scalar { id: ID! }");
-        assert_eq!(
-            vec![
-                "The attribute Scalar.id is non-nullable, but the \
-                 corresponding attribute in the source is nullable"
-            ],
-            dest.can_copy_from(&source)
-        );
-
-        // We can not change a scalar field to an array
-        let dest = test_layout("type Scalar { id: ID, string: [String] }");
-        assert_eq!(
-            vec![
-                "The attribute Scalar.string has type [String], \
-                 but its type in the source is String"
-            ],
-            dest.can_copy_from(&source)
-        );
-        // We can not change an array field to a scalar
-        assert_eq!(
-            vec![
-                "The attribute Scalar.string has type String, \
-                 but its type in the source is [String]"
-            ],
-            source.can_copy_from(&dest)
-        );
-        // We can not change the underlying type of a field
-        let dest = test_layout("type Scalar { id: ID, color: Int }");
-        assert_eq!(
-            vec![
-                "The attribute Scalar.color has type Int, but \
-                 its type in the source is Color"
-            ],
-            dest.can_copy_from(&source)
-        );
-        // We can not change the underlying type of a field in arrays
-        let source = test_layout("type Scalar { id: ID, color: [Int!]! }");
-        let dest = test_layout("type Scalar { id: ID, color: [String!]! }");
-        assert_eq!(
-            vec![
-                "The attribute Scalar.color has type [String!]!, but \
-                 its type in the source is [Int!]!"
-            ],
-            dest.can_copy_from(&source)
-        );
-    }
-
-    const THING_GQL: &str = "
-        type Thing @entity {
-            id: ID!
-            bigThing: Thing!
+impl LayoutCache {
+    pub fn new(ttl: Duration) -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            ttl,
+            refresh: Mutex::new(()),
         }
+    }
 
-        enum Color { yellow, red, BLUE }
+    fn load(conn: &PgConnection, site: Arc<Site>) -> Result<Arc<Layout>, StoreError> {
+        let (subgraph_schema, use_bytea_prefix) = deployment::schema(conn, site.as_ref())?;
+        let has_causality_region = deployment::entities_with_causality_region(conn, site.id)?;
+        let catalog = Catalog::load(conn, site.clone(), use_bytea_prefix, has_causality_region)?;
+        let layout = Arc::new(Layout::new(site.clone(), &subgraph_schema, catalog)?);
+        layout.refresh(conn, site)
+    }
 
-        enum Size { small, medium, large }
-
-        type Scalar {
-            id: ID,
-            bool: Boolean,
-            int: Int,
-            bigDecimal: BigDecimal,
-            string: String,
-            bytes: Bytes,
-            bigInt: BigInt,
-            color: Color,
-        }";
-
-    const THING_DDL: &str = "create type rel.\"color\"
-    as enum ('BLUE', 'red', 'yellow');
-create type rel.\"size\"
-    as enum (\'large\', \'medium\', \'small\');
-create table rel.\"thing\" (
-        \"id\"                 text not null,
-        \"big_thing\"          text not null,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_thing
-    on rel.thing
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_0_0_thing_id
-    on rel.\"thing\" using btree(\"id\");
-create index attr_0_1_thing_big_thing
-    on rel.\"thing\" using btree(\"big_thing\");
-
-create table rel.\"scalar\" (
-        \"id\"                 text not null,
-        \"bool\"               boolean,
-        \"int\"                integer,
-        \"big_decimal\"        numeric,
-        \"string\"             text,
-        \"bytes\"              bytea,
-        \"big_int\"            numeric,
-        \"color\"              \"rel\".\"color\",
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_scalar
-    on rel.scalar
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_1_0_scalar_id
-    on rel.\"scalar\" using btree(\"id\");
-create index attr_1_1_scalar_bool
-    on rel.\"scalar\" using btree(\"bool\");
-create index attr_1_2_scalar_int
-    on rel.\"scalar\" using btree(\"int\");
-create index attr_1_3_scalar_big_decimal
-    on rel.\"scalar\" using btree(\"big_decimal\");
-create index attr_1_4_scalar_string
-    on rel.\"scalar\" using btree(left(\"string\", 256));
-create index attr_1_5_scalar_bytes
-    on rel.\"scalar\" using btree(\"bytes\");
-create index attr_1_6_scalar_big_int
-    on rel.\"scalar\" using btree(\"big_int\");
-create index attr_1_7_scalar_color
-    on rel.\"scalar\" using btree(\"color\");
-
-";
-
-    const MUSIC_GQL: &str = "type Musician @entity {
-    id: ID!
-    name: String!
-    mainBand: Band
-    bands: [Band!]!
-    writtenSongs: [Song]! @derivedFrom(field: \"writtenBy\")
-}
-
-type Band @entity {
-    id: ID!
-    name: String!
-    members: [Musician!]! @derivedFrom(field: \"bands\")
-    originalSongs: [Song!]!
-}
-
-type Song @entity {
-    id: ID!
-    title: String!
-    writtenBy: Musician!
-    band: Band @derivedFrom(field: \"originalSongs\")
-}
-
-type SongStat @entity {
-    id: ID!
-    song: Song @derivedFrom(field: \"id\")
-    played: Int!
-}";
-    const MUSIC_DDL: &str = "create table rel.\"musician\" (
-        \"id\"                 text not null,
-        \"name\"               text not null,
-        \"main_band\"          text,
-        \"bands\"              text[] not null,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_musician
-    on rel.musician
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_0_0_musician_id
-    on rel.\"musician\" using btree(\"id\");
-create index attr_0_1_musician_name
-    on rel.\"musician\" using btree(left(\"name\", 256));
-create index attr_0_2_musician_main_band
-    on rel.\"musician\" using btree(\"main_band\");
-create index attr_0_3_musician_bands
-    on rel.\"musician\" using gin(\"bands\");
-
-create table rel.\"band\" (
-        \"id\"                 text not null,
-        \"name\"               text not null,
-        \"original_songs\"     text[] not null,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_band
-    on rel.band
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_1_0_band_id
-    on rel.\"band\" using btree(\"id\");
-create index attr_1_1_band_name
-    on rel.\"band\" using btree(left(\"name\", 256));
-create index attr_1_2_band_original_songs
-    on rel.\"band\" using gin(\"original_songs\");
-
-create table rel.\"song\" (
-        \"id\"                 text not null,
-        \"title\"              text not null,
-        \"written_by\"         text not null,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_song
-    on rel.song
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_2_0_song_id
-    on rel.\"song\" using btree(\"id\");
-create index attr_2_1_song_title
-    on rel.\"song\" using btree(left(\"title\", 256));
-create index attr_2_2_song_written_by
-    on rel.\"song\" using btree(\"written_by\");
-
-create table rel.\"song_stat\" (
-        \"id\"                 text not null,
-        \"played\"             integer not null,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_song_stat
-    on rel.song_stat
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_3_0_song_stat_id
-    on rel.\"song_stat\" using btree(\"id\");
-create index attr_3_1_song_stat_played
-    on rel.\"song_stat\" using btree(\"played\");
-
-";
-
-    const FOREST_GQL: &str = "
-interface ForestDweller {
-    id: ID!,
-    forest: Forest
-}
-type Animal implements ForestDweller @entity {
-     id: ID!,
-     forest: Forest
-}
-type Forest @entity {
-    id: ID!,
-    # Array of interfaces as derived reference
-    dwellers: [ForestDweller!]! @derivedFrom(field: \"forest\")
-}
-type Habitat @entity {
-    id: ID!,
-    # Use interface as direct reference
-    most_common: ForestDweller!,
-    dwellers: [ForestDweller!]!
-}";
-
-    const FOREST_DDL: &str = "create table rel.\"animal\" (
-        \"id\"                 text not null,
-        \"forest\"             text,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_animal
-    on rel.animal
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_0_0_animal_id
-    on rel.\"animal\" using btree(\"id\");
-create index attr_0_1_animal_forest
-    on rel.\"animal\" using btree(\"forest\");
-
-create table rel.\"forest\" (
-        \"id\"                 text not null,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_forest
-    on rel.forest
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_1_0_forest_id
-    on rel.\"forest\" using btree(\"id\");
-
-create table rel.\"habitat\" (
-        \"id\"                 text not null,
-        \"most_common\"        text not null,
-        \"dwellers\"           text[] not null,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_habitat
-    on rel.habitat
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_2_0_habitat_id
-    on rel.\"habitat\" using btree(\"id\");
-create index attr_2_1_habitat_most_common
-    on rel.\"habitat\" using btree(\"most_common\");
-create index attr_2_2_habitat_dwellers
-    on rel.\"habitat\" using gin(\"dwellers\");
-
-";
-    const FULLTEXT_GQL: &str = "
-type _Schema_ @fulltext(
-    name: \"search\"
-    language: en
-    algorithm: rank
-    include: [\
-        {
-            entity: \"Animal\",
-            fields: [
-                {name: \"name\"},
-                {name: \"species\"}
-            ]
+    fn cache(&self, layout: Arc<Layout>) {
+        if layout.is_cacheable() {
+            let deployment = layout.site.deployment.clone();
+            let entry = CacheEntry {
+                expires: Instant::now() + self.ttl,
+                value: layout,
+            };
+            self.entries.lock().unwrap().insert(deployment, entry);
         }
-    ]
-)
-type Animal @entity  {
-    id: ID!,
-    name: String!
-    species: String!
-    forest: Forest
-}
-type Forest @entity {
-    id: ID!,
-    dwellers: [Animal!]! @derivedFrom(field: \"forest\")
-}
-type Habitat @entity {
-    id: ID!,
-    most_common: Animal!,
-    dwellers: [Animal!]!
-}";
+    }
 
-    const FULLTEXT_DDL: &str = "create table rel.\"animal\" (
-        \"id\"                 text not null,
-        \"name\"               text not null,
-        \"species\"            text not null,
-        \"forest\"             text,
-        \"search\"             tsvector,
+    /// Return the corresponding layout if we have one in cache already, and
+    /// ignore expiration information
+    pub(crate) fn find(&self, site: &Site) -> Option<Arc<Layout>> {
+        self.entries
+            .lock()
+            .unwrap()
+            .get(&site.deployment)
+            .map(|CacheEntry { value, expires: _ }| value.clone())
+    }
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_animal
-    on rel.animal
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_0_0_animal_id
-    on rel.\"animal\" using btree(\"id\");
-create index attr_0_1_animal_name
-    on rel.\"animal\" using btree(left(\"name\", 256));
-create index attr_0_2_animal_species
-    on rel.\"animal\" using btree(left(\"species\", 256));
-create index attr_0_3_animal_forest
-    on rel.\"animal\" using btree(\"forest\");
-create index attr_0_4_animal_search
-    on rel.\"animal\" using gin(\"search\");
+    /// Get the layout for `site`. If it's not in cache, load it. If it is
+    /// expired, try to refresh it if there isn't another refresh happening
+    /// already
+    pub fn get(
+        &self,
+        logger: &Logger,
+        conn: &PgConnection,
+        site: Arc<Site>,
+    ) -> Result<Arc<Layout>, StoreError> {
+        let now = Instant::now();
+        let entry = {
+            let lock = self.entries.lock().unwrap();
+            lock.get(&site.deployment).cloned()
+        };
+        match entry {
+            Some(CacheEntry { value, expires }) => {
+                if now <= expires {
+                    // Entry is not expired; use it
+                    Ok(value)
+                } else {
+                    // Only do a cache refresh once; we don't want to have
+                    // multiple threads refreshing the same layout
+                    // simultaneously. It's easiest to refresh at most one
+                    // layout globally
+                    let refresh = self.refresh.try_lock();
+                    if refresh.is_err() {
+                        return Ok(value);
+                    }
+                    match value.cheap_clone().refresh(conn, site) {
+                        Err(e) => {
+                            warn!(
+                                logger,
+                                "failed to refresh statistics. Continuing with old statistics";
+                                "deployment" => &value.site.deployment,
+                                "error" => e.to_string()
+                            );
+                            // Update the timestamp so we don't retry
+                            // refreshing too often
+                            self.cache(value.cheap_clone());
+                            Ok(value)
+                        }
+                        Ok(layout) => {
+                            self.cache(layout.cheap_clone());
+                            Ok(layout)
+                        }
+                    }
+                }
+            }
+            None => {
+                let layout = Self::load(conn, site)?;
+                self.cache(layout.cheap_clone());
+                Ok(layout)
+            }
+        }
+    }
 
-create table rel.\"forest\" (
-        \"id\"                 text not null,
+    pub(crate) fn remove(&self, site: &Site) -> Option<Arc<Layout>> {
+        self.entries
+            .lock()
+            .unwrap()
+            .remove(&site.deployment)
+            .map(|CacheEntry { value, expires: _ }| value)
+    }
 
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_forest
-    on rel.forest
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_1_0_forest_id
-    on rel.\"forest\" using btree(\"id\");
-
-create table rel.\"habitat\" (
-        \"id\"                 text not null,
-        \"most_common\"        text not null,
-        \"dwellers\"           text[] not null,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_habitat
-    on rel.habitat
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_2_0_habitat_id
-    on rel.\"habitat\" using btree(\"id\");
-create index attr_2_1_habitat_most_common
-    on rel.\"habitat\" using btree(\"most_common\");
-create index attr_2_2_habitat_dwellers
-    on rel.\"habitat\" using gin(\"dwellers\");
-
-";
-
-    const FORWARD_ENUM_GQL: &str = "
-type Thing @entity  {
-    id: ID!,
-    orientation: Orientation!
-}
-
-enum Orientation {
-    UP, DOWN
-}
-";
-
-    const FORWARD_ENUM_SQL: &str = "create type rel.\"orientation\"
-    as enum (\'DOWN\', \'UP\');
-create table rel.\"thing\" (
-        \"id\"                 text not null,
-        \"orientation\"        \"rel\".\"orientation\" not null,
-
-        vid                  bigserial primary key,
-        block_range          int4range not null,
-        exclude using gist   (id with =, block_range with &&)
-);
-create index brin_thing
-    on rel.thing
- using brin(lower(block_range), coalesce(upper(block_range), 2147483647), vid);
-create index attr_0_0_thing_id
-    on rel.\"thing\" using btree(\"id\");
-create index attr_0_1_thing_orientation
-    on rel.\"thing\" using btree(\"orientation\");
-
-";
+    // Only needed for tests
+    #[cfg(debug_assertions)]
+    pub(crate) fn clear(&self) {
+        self.entries.lock().unwrap().clear()
+    }
 }

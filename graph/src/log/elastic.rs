@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use chrono::prelude::{SecondsFormat, Utc};
 use futures03::TryFutureExt;
+use http::header::CONTENT_TYPE;
+use prometheus::Counter;
 use reqwest;
 use reqwest::Client;
 use serde::ser::Serializer as SerdeSerializer;
@@ -14,6 +16,8 @@ use serde::Serialize;
 use serde_json::json;
 use slog::*;
 use slog_async;
+
+use crate::util::futures::retry;
 
 /// General configuration parameters for Elasticsearch logging.
 #[derive(Clone, Debug)]
@@ -24,6 +28,8 @@ pub struct ElasticLoggingConfig {
     pub username: Option<String>,
     /// The Elasticsearch password (optional).
     pub password: Option<String>,
+    /// A client to serve as a connection pool to the endpoint.
+    pub client: Client,
 }
 
 /// Serializes an slog log level using a serde Serializer.
@@ -87,7 +93,8 @@ impl HashMapKVSerializer {
 
 impl Serializer for HashMapKVSerializer {
     fn emit_arguments(&mut self, key: Key, val: &fmt::Arguments) -> slog::Result {
-        Ok(self.kvs.push((key.into(), format!("{}", val))))
+        self.kvs.push((key.into(), format!("{}", val)));
+        Ok(())
     }
 }
 
@@ -120,7 +127,8 @@ impl SimpleKVSerializer {
 
 impl Serializer for SimpleKVSerializer {
     fn emit_arguments(&mut self, key: Key, val: &fmt::Arguments) -> slog::Result {
-        Ok(self.kvs.push((key.into(), format!("{}", val))))
+        self.kvs.push((key.into(), format!("{}", val)));
+        Ok(())
     }
 }
 
@@ -139,6 +147,8 @@ pub struct ElasticDrainConfig {
     pub custom_id_value: String,
     /// The batching interval.
     pub flush_interval: Duration,
+    /// Maximum retries in case of error.
+    pub max_retries: usize,
 }
 
 /// An slog `Drain` for logging to Elasticsearch.
@@ -166,15 +176,21 @@ pub struct ElasticDrainConfig {
 pub struct ElasticDrain {
     config: ElasticDrainConfig,
     error_logger: Logger,
+    logs_sent_counter: Counter,
     logs: Arc<Mutex<Vec<ElasticLog>>>,
 }
 
 impl ElasticDrain {
     /// Creates a new `ElasticDrain`.
-    pub fn new(config: ElasticDrainConfig, error_logger: Logger) -> Self {
+    pub fn new(
+        config: ElasticDrainConfig,
+        error_logger: Logger,
+        logs_sent_counter: Counter,
+    ) -> Self {
         let drain = ElasticDrain {
             config,
             error_logger,
+            logs_sent_counter,
             logs: Arc::new(Mutex::new(vec![])),
         };
         drain.periodically_flush_logs();
@@ -182,111 +198,113 @@ impl ElasticDrain {
     }
 
     fn periodically_flush_logs(&self) {
-        use futures03::stream::StreamExt;
-
         let flush_logger = self.error_logger.clone();
+        let logs_sent_counter = self.logs_sent_counter.clone();
         let logs = self.logs.clone();
         let config = self.config.clone();
+        let mut interval = tokio::time::interval(self.config.flush_interval);
+        let max_retries = self.config.max_retries;
 
-        crate::task_spawn::spawn(tokio::time::interval(self.config.flush_interval).for_each(
-            move |_| {
+        crate::task_spawn::spawn(async move {
+            loop {
+                interval.tick().await;
+
                 let logs = logs.clone();
                 let config = config.clone();
-                let flush_logger = flush_logger.clone();
-                async move {
-                    let logs_to_send = {
-                        let mut logs = logs.lock().unwrap();
-                        let logs_to_send = (*logs).clone();
-                        // Clear the logs, so the next batch can be recorded
-                        logs.clear();
-                        logs_to_send
-                    };
+                let logs_to_send = {
+                    let mut logs = logs.lock().unwrap();
+                    let logs_to_send = (*logs).clone();
+                    // Clear the logs, so the next batch can be recorded
+                    logs.clear();
+                    logs_to_send
+                };
 
-                    // Do nothing if there are no logs to flush
-                    if logs_to_send.is_empty() {
-                        return;
-                    }
-
-                    trace!(
-                        flush_logger,
-                        "Flushing {} logs to Elasticsearch",
-                        logs_to_send.len()
-                    );
-
-                    // The Elasticsearch batch API takes requests with the following format:
-                    // ```ignore
-                    // action_and_meta_data\n
-                    // optional_source\n
-                    // action_and_meta_data\n
-                    // optional_source\n
-                    // ```
-                    // For more details, see:
-                    // https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
-                    //
-                    // We're assembly the request body in the same way below:
-                    let batch_body = logs_to_send.iter().fold(String::from(""), |mut out, log| {
-                        // Try to serialize the log itself to a JSON string
-                        match serde_json::to_string(log) {
-                            Ok(log_line) => {
-                                // Serialize the action line to a string
-                                let action_line = json!({
-                                    "index": {
-                                        "_index": config.index,
-                                        "_type": config.document_type,
-                                        "_id": log.id,
-                                    }
-                                })
-                                .to_string();
-
-                                // Combine the two lines with newlines, make sure there is
-                                // a newline at the end as well
-                                out.push_str(format!("{}\n{}\n", action_line, log_line).as_str());
-                            }
-                            Err(e) => {
-                                error!(
-                                    flush_logger,
-                                    "Failed to serialize Elasticsearch log to JSON: {}", e
-                                );
-                            }
-                        };
-
-                        out
-                    });
-
-                    // Build the batch API URL
-                    let mut batch_url = reqwest::Url::parse(config.general.endpoint.as_str())
-                        .expect("invalid Elasticsearch URL");
-                    batch_url.set_path("_bulk");
-
-                    // Send batch of logs to Elasticsearch
-                    let client = Client::new();
-                    let logger_for_err = flush_logger.clone();
-
-                    let header = match config.general.username {
-                        Some(username) => client
-                            .post(batch_url)
-                            .header("Content-Type", "application/json")
-                            .basic_auth(username, config.general.password.clone()),
-                        None => client
-                            .post(batch_url)
-                            .header("Content-Type", "application/json"),
-                    };
-                    header
-                        .body(batch_body)
-                        .send()
-                        .and_then(|response| async { response.error_for_status() })
-                        .map_ok(|_| ())
-                        .unwrap_or_else(move |e| {
-                            // Log if there was a problem sending the logs
-                            error!(
-                                logger_for_err,
-                                "Failed to send logs to Elasticsearch: {}", e
-                            );
-                        })
-                        .await;
+                // Do nothing if there are no logs to flush
+                if logs_to_send.is_empty() {
+                    continue;
                 }
-            },
-        ));
+
+                logs_sent_counter.inc_by(logs_to_send.len() as f64);
+
+                // The Elasticsearch batch API takes requests with the following format:
+                // ```ignore
+                // action_and_meta_data\n
+                // optional_source\n
+                // action_and_meta_data\n
+                // optional_source\n
+                // ```
+                // For more details, see:
+                // https://www.elastic.co/guide/en/elasticsearch/reference/current/docs-bulk.html
+                //
+                // We're assembly the request body in the same way below:
+                let batch_body = logs_to_send.iter().fold(String::from(""), |mut out, log| {
+                    // Try to serialize the log itself to a JSON string
+                    match serde_json::to_string(log) {
+                        Ok(log_line) => {
+                            // Serialize the action line to a string
+                            let action_line = json!({
+                                "index": {
+                                    "_index": config.index,
+                                    "_type": config.document_type,
+                                    "_id": log.id,
+                                }
+                            })
+                            .to_string();
+
+                            // Combine the two lines with newlines, make sure there is
+                            // a newline at the end as well
+                            out.push_str(format!("{}\n{}\n", action_line, log_line).as_str());
+                        }
+                        Err(e) => {
+                            error!(
+                                flush_logger,
+                                "Failed to serialize Elasticsearch log to JSON: {}", e
+                            );
+                        }
+                    };
+
+                    out
+                });
+
+                // Build the batch API URL
+                let mut batch_url = reqwest::Url::parse(config.general.endpoint.as_str())
+                    .expect("invalid Elasticsearch URL");
+                batch_url.set_path("_bulk");
+
+                // Send batch of logs to Elasticsearch
+                let header = match config.general.username {
+                    Some(username) => config
+                        .general
+                        .client
+                        .post(batch_url)
+                        .header(CONTENT_TYPE, "application/json")
+                        .basic_auth(username, config.general.password.clone()),
+                    None => config
+                        .general
+                        .client
+                        .post(batch_url)
+                        .header(CONTENT_TYPE, "application/json"),
+                };
+
+                retry("send logs to elasticsearch", &flush_logger)
+                    .limit(max_retries)
+                    .timeout_secs(30)
+                    .run(move || {
+                        header
+                            .try_clone()
+                            .unwrap() // Unwrap: Request body not yet set
+                            .body(batch_body.clone())
+                            .send()
+                            .and_then(|response| async { response.error_for_status() })
+                            .map_ok(|_| ())
+                    })
+                    .await
+                    .unwrap_or_else(|e| {
+                        // Log if there was a problem sending the logs
+                        error!(flush_logger, "Failed to send logs to Elasticsearch: {}", e);
+                    })
+            }
+        });
     }
 }
 
@@ -342,8 +360,8 @@ impl Drain for ElasticDrain {
 
         // Prepare log document
         let log = ElasticLog {
-            id: id.clone(),
-            custom_id: custom_id,
+            id,
+            custom_id,
             arguments,
             timestamp,
             text,
@@ -367,10 +385,14 @@ impl Drain for ElasticDrain {
 ///
 /// Uses `error_logger` to print any Elasticsearch logging errors,
 /// so they don't go unnoticed.
-pub fn elastic_logger(config: ElasticDrainConfig, error_logger: Logger) -> Logger {
-    let elastic_drain = ElasticDrain::new(config, error_logger).fuse();
+pub fn elastic_logger(
+    config: ElasticDrainConfig,
+    error_logger: Logger,
+    logs_sent_counter: Counter,
+) -> Logger {
+    let elastic_drain = ElasticDrain::new(config, error_logger, logs_sent_counter).fuse();
     let async_drain = slog_async::Async::new(elastic_drain)
-        .chan_size(10000)
+        .chan_size(20000)
         .build()
         .fuse();
     Logger::root(async_drain, o!())

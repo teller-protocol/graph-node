@@ -1,9 +1,13 @@
-use std::time::Duration;
+use std::sync::Arc;
 
-use crate::data::subgraph::SubgraphDeploymentId;
+use prometheus::Counter;
+use slog::*;
+
+use crate::components::metrics::MetricsRegistry;
+use crate::components::store::DeploymentLocator;
 use crate::log::elastic::*;
 use crate::log::split::*;
-use slog::*;
+use crate::prelude::ENV_VARS;
 
 /// Configuration for component-specific logging to Elasticsearch.
 pub struct ElasticComponentLoggerConfig {
@@ -20,14 +24,20 @@ pub struct ComponentLoggerConfig {
 pub struct LoggerFactory {
     parent: Logger,
     elastic_config: Option<ElasticLoggingConfig>,
+    metrics_registry: Arc<MetricsRegistry>,
 }
 
 impl LoggerFactory {
     /// Creates a new factory using a parent logger and optional Elasticsearch configuration.
-    pub fn new(logger: Logger, elastic_config: Option<ElasticLoggingConfig>) -> Self {
+    pub fn new(
+        logger: Logger,
+        elastic_config: Option<ElasticLoggingConfig>,
+        metrics_registry: Arc<MetricsRegistry>,
+    ) -> Self {
         Self {
             parent: logger,
             elastic_config,
+            metrics_registry,
         }
     }
 
@@ -36,6 +46,7 @@ impl LoggerFactory {
         Self {
             parent,
             elastic_config: self.elastic_config.clone(),
+            metrics_registry: self.metrics_registry.clone(),
         }
     }
 
@@ -64,9 +75,11 @@ impl LoggerFactory {
                                     document_type: String::from("log"),
                                     custom_id_key: String::from("componentId"),
                                     custom_id_value: component.to_string(),
-                                    flush_interval: Duration::from_secs(5),
+                                    flush_interval: ENV_VARS.elastic_search_flush_interval,
+                                    max_retries: ENV_VARS.elastic_search_max_retries,
                                 },
                                 term_logger.clone(),
+                                self.logs_sent_counter(None),
                             ),
                         )
                     })
@@ -76,10 +89,10 @@ impl LoggerFactory {
     }
 
     /// Creates a subgraph logger with Elasticsearch support.
-    pub fn subgraph_logger(&self, subgraph_id: &SubgraphDeploymentId) -> Logger {
+    pub fn subgraph_logger(&self, loc: &DeploymentLocator) -> Logger {
         let term_logger = self
             .parent
-            .new(o!("subgraph_id" => subgraph_id.to_string()));
+            .new(o!("subgraph_id" => loc.hash.to_string(), "sgd" => loc.id.to_string()));
 
         self.elastic_config
             .clone()
@@ -92,13 +105,25 @@ impl LoggerFactory {
                             index: String::from("subgraph-logs"),
                             document_type: String::from("log"),
                             custom_id_key: String::from("subgraphId"),
-                            custom_id_value: subgraph_id.to_string(),
-                            flush_interval: Duration::from_secs(5),
+                            custom_id_value: loc.hash.to_string(),
+                            flush_interval: ENV_VARS.elastic_search_flush_interval,
+                            max_retries: ENV_VARS.elastic_search_max_retries,
                         },
                         term_logger.clone(),
+                        self.logs_sent_counter(Some(loc.hash.as_str())),
                     ),
                 )
             })
             .unwrap_or(term_logger)
+    }
+
+    fn logs_sent_counter(&self, deployment: Option<&str>) -> Counter {
+        self.metrics_registry
+            .global_deployment_counter(
+                "graph_elasticsearch_logs_sent",
+                "Count of logs sent to Elasticsearch endpoint",
+                deployment.unwrap_or(""),
+            )
+            .unwrap()
     }
 }

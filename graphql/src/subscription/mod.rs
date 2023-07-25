@@ -1,43 +1,26 @@
-use graphql_parser::{query as q, schema as s};
-use std::collections::HashMap;
 use std::result::Result;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use graph::prelude::*;
-use tokio::sync::Semaphore;
+use graph::components::store::UnitStream;
+use graph::schema::ApiSchema;
+use graph::{components::store::SubscriptionManager, prelude::*, schema::ErrorPolicy};
 
-use crate::execution::*;
-use crate::schema::ast as sast;
-
-use lazy_static::lazy_static;
-
-lazy_static! {
-    static ref SUBSCRIPTION_QUERY_SEMAPHORE: Semaphore = {
-        // This is duplicating the logic in main.rs to get the connection pool size, which is
-        // unfortunate. But because this module has no share state otherwise, it's not simple to
-        // refactor so that the semaphore isn't a global.
-        // See also 82d5dad6-b633-4350-86d9-70c8b2e65805
-        let db_conn_pool_size = std::env::var("STORE_CONNECTION_POOL_SIZE")
-            .unwrap_or("10".into())
-            .parse::<usize>()
-            .expect("invalid STORE_CONNECTION_POOL_SIZE");
-
-        // Limit the amount of connections that can be taken up by subscription queries.
-        Semaphore::new((0.7 * db_conn_pool_size as f64).ceil() as usize)
-    };
-}
+use crate::metrics::GraphQLMetrics;
+use crate::{
+    execution::ast as a,
+    execution::*,
+    prelude::{BlockConstraint, StoreResolver},
+};
 
 /// Options available for subscription execution.
-pub struct SubscriptionExecutionOptions<R>
-where
-    R: Resolver,
-{
+pub struct SubscriptionExecutionOptions {
     /// The logger to use during subscription execution.
     pub logger: Logger,
 
-    /// The resolver to use.
-    pub resolver: R,
+    /// The store to use.
+    pub store: Arc<dyn QueryStore>,
+
+    pub subscription_manager: Arc<dyn SubscriptionManager>,
 
     /// Individual timeout for each subscription query.
     pub timeout: Option<Duration>,
@@ -50,40 +33,34 @@ where
 
     /// Maximum value for the `first` argument.
     pub max_first: u32,
+
+    /// Maximum value for the `skip` argument.
+    pub max_skip: u32,
+
+    pub graphql_metrics: Arc<GraphQLMetrics>,
 }
 
-pub fn execute_subscription<R>(
+pub fn execute_subscription(
     subscription: Subscription,
-    options: SubscriptionExecutionOptions<R>,
-) -> Result<SubscriptionResult, SubscriptionError>
-where
-    R: Resolver + 'static,
-{
+    schema: Arc<ApiSchema>,
+    options: SubscriptionExecutionOptions,
+) -> Result<SubscriptionResult, SubscriptionError> {
     let query = crate::execution::Query::new(
+        &options.logger,
+        schema,
+        None,
         subscription.query,
         options.max_complexity,
         options.max_depth,
+        options.graphql_metrics.cheap_clone(),
     )?;
     execute_prepared_subscription(query, options)
 }
 
-pub(crate) fn execute_prepared_subscription<R>(
+pub(crate) fn execute_prepared_subscription(
     query: Arc<crate::execution::Query>,
-    options: SubscriptionExecutionOptions<R>,
-) -> Result<SubscriptionResult, SubscriptionError>
-where
-    R: Resolver + 'static,
-{
-    // Create a fresh execution context
-    let ctx = ExecutionContext {
-        logger: options.logger,
-        resolver: Arc::new(options.resolver),
-        query: query.clone(),
-        deadline: None,
-        max_first: options.max_first,
-        mode: ExecutionMode::Prefetch,
-    };
-
+    options: SubscriptionExecutionOptions,
+) -> Result<SubscriptionResult, SubscriptionError> {
     if !query.is_subscription() {
         return Err(SubscriptionError::from(QueryExecutionError::NotSupported(
             "Only subscriptions are supported".to_string(),
@@ -91,133 +68,174 @@ where
     }
 
     info!(
-        ctx.logger,
+        options.logger,
         "Execute subscription";
         "query" => &query.query_text,
     );
 
-    let source_stream = create_source_event_stream(&ctx)?;
-    let response_stream = map_source_to_response_stream(&ctx, source_stream, options.timeout);
+    let source_stream = create_source_event_stream(query.clone(), &options)?;
+    let response_stream = map_source_to_response_stream(query, options, source_stream);
     Ok(response_stream)
 }
 
 fn create_source_event_stream(
-    ctx: &ExecutionContext<impl Resolver>,
-) -> Result<StoreEventStreamBox, SubscriptionError> {
-    let subscription_type = sast::get_root_subscription_type(&ctx.query.schema.document)
+    query: Arc<crate::execution::Query>,
+    options: &SubscriptionExecutionOptions,
+) -> Result<UnitStream, SubscriptionError> {
+    let resolver = StoreResolver::for_subscription(
+        &options.logger,
+        query.schema.id().clone(),
+        options.store.clone(),
+        options.subscription_manager.cheap_clone(),
+        options.graphql_metrics.cheap_clone(),
+    );
+    let ctx = ExecutionContext {
+        logger: options.logger.cheap_clone(),
+        resolver,
+        query,
+        deadline: None,
+        max_first: options.max_first,
+        max_skip: options.max_skip,
+        cache_status: Default::default(),
+        trace: ENV_VARS.log_sql_timing(),
+    };
+
+    let subscription_type = ctx
+        .query
+        .schema
+        .subscription_type
+        .as_ref()
         .ok_or(QueryExecutionError::NoRootSubscriptionObjectType)?;
 
-    let grouped_field_set = collect_fields(ctx, &subscription_type, &ctx.query.selection_set, None);
-
-    if grouped_field_set.is_empty() {
+    let field = if ctx.query.selection_set.is_empty() {
         return Err(SubscriptionError::from(QueryExecutionError::EmptyQuery));
-    } else if grouped_field_set.len() > 1 {
-        return Err(SubscriptionError::from(
-            QueryExecutionError::MultipleSubscriptionFields,
-        ));
-    }
+    } else {
+        match ctx.query.selection_set.single_field() {
+            Some(field) => field,
+            None => {
+                return Err(SubscriptionError::from(
+                    QueryExecutionError::MultipleSubscriptionFields,
+                ));
+            }
+        }
+    };
 
-    let fields = grouped_field_set.get_index(0).unwrap();
-    let field = fields.1[0];
-    let argument_values = coerce_argument_values(&ctx, subscription_type, field)?;
-
-    resolve_field_stream(ctx, subscription_type, field, argument_values)
+    resolve_field_stream(&ctx, subscription_type, field)
 }
 
 fn resolve_field_stream(
     ctx: &ExecutionContext<impl Resolver>,
     object_type: &s::ObjectType,
-    field: &q::Field,
-    _argument_values: HashMap<&q::Name, q::Value>,
-) -> Result<StoreEventStreamBox, SubscriptionError> {
+    field: &a::Field,
+) -> Result<UnitStream, SubscriptionError> {
     ctx.resolver
-        .resolve_field_stream(&ctx.query.schema.document, object_type, field)
+        .resolve_field_stream(&ctx.query.schema, object_type, field)
         .map_err(SubscriptionError::from)
 }
 
 fn map_source_to_response_stream(
-    ctx: &ExecutionContext<impl Resolver + 'static>,
-    source_stream: StoreEventStreamBox,
-    timeout: Option<Duration>,
+    query: Arc<crate::execution::Query>,
+    options: SubscriptionExecutionOptions,
+    source_stream: UnitStream,
 ) -> QueryResultStream {
-    let logger = ctx.logger.clone();
-    let resolver = ctx.resolver.clone();
-    let query = ctx.query.cheap_clone();
-    let max_first = ctx.max_first;
-
     // Create a stream with a single empty event. By chaining this in front
     // of the real events, we trick the subscription into executing its query
     // at least once. This satisfies the GraphQL over Websocket protocol
     // requirement of "respond[ing] with at least one GQL_DATA message", see
     // https://github.com/apollographql/subscriptions-transport-ws/blob/master/PROTOCOL.md#gql_data
-    let trigger_stream = futures03::stream::iter(vec![Ok(StoreEvent {
-        tag: 0,
-        changes: Default::default(),
-    })]);
+    let trigger_stream = futures03::stream::once(async {});
 
-    Box::new(
-        trigger_stream
-            .chain(source_stream.compat())
-            .then(move |res| match res {
-                Err(()) => {
-                    futures03::future::ready(QueryExecutionError::EventStreamError.into()).boxed()
-                }
-                Ok(event) => execute_subscription_event(
-                    logger.clone(),
-                    resolver.clone(),
-                    query.clone(),
-                    event,
-                    timeout.clone(),
-                    max_first,
-                )
-                .boxed(),
-            }),
-    )
+    let SubscriptionExecutionOptions {
+        logger,
+        store,
+        subscription_manager,
+        timeout,
+        max_complexity: _,
+        max_depth: _,
+        max_first,
+        max_skip,
+        graphql_metrics,
+    } = options;
+
+    trigger_stream
+        .chain(source_stream)
+        .then(move |()| {
+            execute_subscription_event(
+                logger.clone(),
+                store.clone(),
+                subscription_manager.cheap_clone(),
+                query.clone(),
+                timeout,
+                max_first,
+                max_skip,
+                graphql_metrics.cheap_clone(),
+            )
+            .boxed()
+        })
+        .boxed()
 }
 
 async fn execute_subscription_event(
     logger: Logger,
-    resolver: Arc<impl Resolver + 'static>,
+    store: Arc<dyn QueryStore>,
+    subscription_manager: Arc<dyn SubscriptionManager>,
     query: Arc<crate::execution::Query>,
-    event: StoreEvent,
     timeout: Option<Duration>,
     max_first: u32,
-) -> QueryResult {
-    debug!(logger, "Execute subscription event"; "event" => format!("{:?}", event));
+    max_skip: u32,
+    metrics: Arc<GraphQLMetrics>,
+) -> Arc<QueryResult> {
+    async fn make_resolver(
+        store: Arc<dyn QueryStore>,
+        logger: &Logger,
+        subscription_manager: Arc<dyn SubscriptionManager>,
+        query: &Arc<crate::execution::Query>,
+        metrics: Arc<GraphQLMetrics>,
+    ) -> Result<StoreResolver, QueryExecutionError> {
+        let state = store.deployment_state().await?;
+        StoreResolver::at_block(
+            logger,
+            store,
+            &state,
+            subscription_manager,
+            BlockConstraint::Latest,
+            ErrorPolicy::Deny,
+            query.schema.id().clone(),
+            metrics,
+        )
+        .await
+    }
+
+    let resolver = match make_resolver(store, &logger, subscription_manager, &query, metrics).await
+    {
+        Ok(resolver) => resolver,
+        Err(e) => return Arc::new(e.into()),
+    };
+
+    let block_ptr = resolver.block_ptr.as_ref().map(Into::into);
 
     // Create a fresh execution context with deadline.
-    let ctx = ExecutionContext {
+    let ctx = Arc::new(ExecutionContext {
         logger,
         resolver,
         query,
         deadline: timeout.map(|t| Instant::now() + t),
         max_first,
-        mode: ExecutionMode::Prefetch,
+        max_skip,
+        cache_status: Default::default(),
+        trace: ENV_VARS.log_sql_timing(),
+    });
+
+    let subscription_type = match ctx.query.schema.subscription_type.as_ref() {
+        Some(t) => t.cheap_clone(),
+        None => return Arc::new(QueryExecutionError::NoRootSubscriptionObjectType.into()),
     };
 
-    // We have established that this exists earlier in the subscription execution
-    let subscription_type = sast::get_root_subscription_type(&ctx.query.schema.document)
-        .unwrap()
-        .clone();
-
-    // Use a semaphore to prevent subscription queries, which can be numerous and might query all at
-    // once, from flooding the blocking thread pool and the DB connection pool.
-    let _permit = SUBSCRIPTION_QUERY_SEMAPHORE.acquire();
-    let result = graph::spawn_blocking_allow_panic(async move {
-        let initial_data = prefetch(&ctx, &ctx.query.selection_set)?;
-        execute_selection_set(
-            &ctx,
-            &ctx.query.selection_set,
-            &subscription_type,
-            &initial_data,
-        )
-    })
+    execute_root_selection_set(
+        ctx.cheap_clone(),
+        ctx.query.selection_set.cheap_clone(),
+        subscription_type.into(),
+        block_ptr,
+    )
     .await
-    .map_err(|e| vec![QueryExecutionError::Panic(e.to_string())])
-    .and_then(|x| x);
-
-    match result {
-        Ok(value) => QueryResult::new(Some(value)),
-        Err(e) => QueryResult::from(e),
-    }
 }

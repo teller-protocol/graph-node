@@ -1,51 +1,81 @@
-use graphql_parser::{query as q, schema as s};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::result;
 use std::sync::Arc;
 
 use graph::components::store::*;
+use graph::data::graphql::{object, ObjectOrInterface};
+use graph::data::query::Trace;
+use graph::data::value::{Object, Word};
 use graph::prelude::*;
+use graph::schema::{ast as sast, ApiSchema, META_FIELD_TYPE};
+use graph::schema::{ErrorPolicy, BLOCK_FIELD_TYPE};
 
+use crate::execution::ast as a;
+use crate::metrics::GraphQLMetrics;
 use crate::prelude::*;
-use crate::query::ast as qast;
 use crate::query::ext::BlockConstraint;
-use crate::schema::ast as sast;
-
-use crate::store::query::{collect_entities_from_query_field, parse_subgraph_id};
+use crate::store::query::collect_entities_from_query_field;
 
 /// A resolver that fetches entities from a `Store`.
-pub struct StoreResolver<S> {
+#[derive(Clone)]
+pub struct StoreResolver {
+    #[allow(dead_code)]
     logger: Logger,
-    pub(crate) store: Arc<S>,
-    pub(crate) block: BlockNumber,
+    pub(crate) store: Arc<dyn QueryStore>,
+    subscription_manager: Arc<dyn SubscriptionManager>,
+    pub(crate) block_ptr: Option<BlockPtrTs>,
+    deployment: DeploymentHash,
+    has_non_fatal_errors: bool,
+    error_policy: ErrorPolicy,
+    graphql_metrics: Arc<GraphQLMetrics>,
 }
 
-impl<S> Clone for StoreResolver<S>
-where
-    S: Store,
-{
-    fn clone(&self) -> Self {
-        StoreResolver {
-            logger: self.logger.clone(),
-            store: self.store.clone(),
-            block: self.block.clone(),
+#[derive(Clone, Debug)]
+pub(crate) struct BlockPtrTs {
+    pub ptr: BlockPtr,
+    pub timestamp: Option<u64>,
+}
+
+impl From<BlockPtr> for BlockPtrTs {
+    fn from(ptr: BlockPtr) -> Self {
+        Self {
+            ptr,
+            timestamp: None,
         }
     }
 }
 
-impl<S> StoreResolver<S>
-where
-    S: Store + SubgraphDeploymentStore,
-{
+impl From<&BlockPtrTs> for BlockPtr {
+    fn from(ptr: &BlockPtrTs) -> Self {
+        ptr.ptr.cheap_clone()
+    }
+}
+
+impl CheapClone for StoreResolver {}
+
+impl StoreResolver {
     /// Create a resolver that looks up entities at whatever block is the
     /// latest when the query is run. That means that multiple calls to find
     /// entities into this resolver might return entities from different
     /// blocks
-    pub fn new(logger: &Logger, store: Arc<S>) -> Self {
+    pub fn for_subscription(
+        logger: &Logger,
+        deployment: DeploymentHash,
+        store: Arc<dyn QueryStore>,
+        subscription_manager: Arc<dyn SubscriptionManager>,
+        graphql_metrics: Arc<GraphQLMetrics>,
+    ) -> Self {
         StoreResolver {
             logger: logger.new(o!("component" => "StoreResolver")),
             store,
-            block: BLOCK_NUMBER_MAX,
+            subscription_manager,
+            block_ptr: None,
+            deployment,
+
+            // Checking for non-fatal errors does not work with subscriptions.
+            has_non_fatal_errors: false,
+            error_policy: ErrorPolicy::Deny,
+            graphql_metrics,
         }
     }
 
@@ -54,473 +84,305 @@ where
     /// of that block. Note that if `bc` is `BlockConstraint::Latest` we use
     /// whatever the latest block for the subgraph was when the resolver was
     /// created
-    pub fn at_block(
+    pub async fn at_block(
         logger: &Logger,
-        store: Arc<S>,
+        store: Arc<dyn QueryStore>,
+        state: &DeploymentState,
+        subscription_manager: Arc<dyn SubscriptionManager>,
         bc: BlockConstraint,
-        subgraph: &SubgraphDeploymentId,
-    ) -> Result<(Self, EthereumBlockPointer), QueryExecutionError> {
-        let block_ptr = Self::locate_block(store.as_ref(), bc, subgraph)?;
+        error_policy: ErrorPolicy,
+        deployment: DeploymentHash,
+        graphql_metrics: Arc<GraphQLMetrics>,
+    ) -> Result<Self, QueryExecutionError> {
+        let store_clone = store.cheap_clone();
+        let block_ptr = Self::locate_block(store_clone.as_ref(), bc, state).await?;
+
+        let has_non_fatal_errors = store
+            .has_deterministic_errors(block_ptr.ptr.block_number())
+            .await?;
+
         let resolver = StoreResolver {
             logger: logger.new(o!("component" => "StoreResolver")),
             store,
-            block: block_ptr.number as i32,
+            subscription_manager,
+            block_ptr: Some(block_ptr),
+            deployment,
+            has_non_fatal_errors,
+            error_policy,
+            graphql_metrics,
         };
-        Ok((resolver, block_ptr))
+        Ok(resolver)
     }
 
-    /// Adds a filter for matching entities that correspond to a derived field.
-    ///
-    /// Returns true if the field is a derived field (i.e., if it is defined with
-    /// a @derivedFrom directive).
-    fn add_filter_for_derived_field(
-        query: &mut EntityQuery,
-        parent: &Option<q::Value>,
-        derived_from_field: &s::Field,
-    ) {
-        // This field is derived from a field in the object type that we're trying
-        // to resolve values for; e.g. a `bandMembers` field maybe be derived from
-        // a `bands` or `band` field in a `Musician` type.
-        //
-        // Our goal here is to identify the ID of the parent entity (e.g. the ID of
-        // a band) and add a `Contains("bands", [<id>])` or `Equal("band", <id>)`
-        // filter to the arguments.
-
-        let field_name = derived_from_field.name.clone();
-
-        // To achieve this, we first identify the parent ID
-        let parent_id = parent
+    pub fn block_number(&self) -> BlockNumber {
+        self.block_ptr
             .as_ref()
-            .and_then(|value| match value {
-                q::Value::Object(o) => Some(o),
-                _ => None,
-            })
-            .and_then(|object| object.get(&q::Name::from("id")))
-            .and_then(|value| match value {
-                q::Value::String(s) => Some(Value::from(s)),
-                _ => None,
-            })
-            .expect("Parent object is missing an \"id\"")
-            .clone();
-
-        // Depending on whether the field we're deriving from has a list or a
-        // single value type, we either create a `Contains` or `Equal`
-        // filter argument
-        let filter = if sast::is_list_or_non_null_list_field(derived_from_field) {
-            EntityFilter::Contains(field_name, Value::List(vec![parent_id]))
-        } else {
-            EntityFilter::Equal(field_name, parent_id)
-        };
-
-        // Add the `Contains`/`Equal` filter to the top-level `And` filter, creating one
-        // if necessary
-        let top_level_filter = query.filter.get_or_insert(EntityFilter::And(vec![]));
-        match top_level_filter {
-            EntityFilter::And(ref mut filters) => {
-                filters.push(filter);
-            }
-            _ => unreachable!("top level filter is always `And`"),
-        };
+            .map(|ptr| ptr.ptr.number as BlockNumber)
+            .unwrap_or(BLOCK_NUMBER_MAX)
     }
 
-    /// Adds a filter for matching entities that are referenced by the given field.
-    fn add_filter_for_reference_field(
-        query: &mut EntityQuery,
-        parent: &Option<q::Value>,
-        field_definition: &s::Field,
-        _object_type: ObjectOrInterface,
-    ) {
-        if let Some(q::Value::Object(object)) = parent {
-            // Create an `Or(Equals("id", ref_id1), ...)` filter that includes
-            // all referenced IDs.
-            let filter = object
-                .get(&field_definition.name)
-                .and_then(|value| match value {
-                    q::Value::String(id) => {
-                        Some(EntityFilter::Equal(String::from("id"), Value::from(id)))
-                    }
-                    q::Value::List(ids) => Some(EntityFilter::Or(
-                        ids.iter()
-                            .filter_map(|id| match id {
-                                q::Value::String(s) => Some(s),
-                                _ => None,
-                            })
-                            .map(|id| EntityFilter::Equal(String::from("id"), Value::from(id)))
-                            .collect(),
-                    )),
-                    _ => None,
-                })
-                .unwrap_or_else(|| {
-                    // Caught by `UnknownField` error.
-                    unreachable!(
-                        "Field \"{}\" missing in parent object",
-                        field_definition.name
-                    )
-                });
-
-            // Add the `Or` filter to the top-level `And` filter, creating one if necessary
-            let top_level_filter = query.filter.get_or_insert(EntityFilter::And(vec![]));
-            match top_level_filter {
-                EntityFilter::And(ref mut filters) => {
-                    filters.push(filter);
-                }
-                _ => unreachable!("top level filter is always `And`"),
-            };
-        }
-    }
-
-    /// Returns true if the object has no references in the given field.
-    fn references_field_is_empty(parent: &Option<q::Value>, field: &q::Name) -> bool {
-        parent
-            .as_ref()
-            .and_then(|value| match value {
-                q::Value::Object(object) => Some(object),
-                _ => None,
-            })
-            .and_then(|object| object.get(field))
-            .map(|value| match value {
-                q::Value::List(values) => values.is_empty(),
-                _ => true,
-            })
-            .unwrap_or(true)
-    }
-
-    fn get_prefetched_child<'a>(
-        parent: &'a Option<q::Value>,
-        field: &q::Field,
-    ) -> Option<&'a q::Value> {
-        match parent {
-            Some(q::Value::Object(map)) => {
-                let key = format!("prefetch:{}", qast::get_response_key(field));
-                map.get(&key)
-            }
-            _ => None,
-        }
-    }
-
-    fn was_prefetched(parent: &Option<q::Value>) -> bool {
-        match parent {
-            Some(q::Value::Object(map)) => map.contains_key(super::prefetch::PREFETCH_KEY),
-            _ => false,
-        }
-    }
-
-    fn resolve_objects_prefetch(
-        &self,
-        parent: &Option<q::Value>,
-        field: &q::Field,
-        object_type: ObjectOrInterface<'_>,
-    ) -> Result<q::Value, QueryExecutionError> {
-        if let Some(child) = Self::get_prefetched_child(parent, field) {
-            Ok(child.clone())
-        } else {
-            Err(QueryExecutionError::ResolveEntitiesError(format!(
-                "internal error resolving {}.{} for {:?}: \
-                 expected prefetched result, but found nothing",
-                object_type.name(),
-                &field.name,
-                parent
-            )))
-        }
-    }
-
-    fn resolve_object_prefetch(
-        &self,
-        parent: &Option<q::Value>,
-        field: &q::Field,
-        field_definition: &s::Field,
-        object_type: ObjectOrInterface<'_>,
-    ) -> Result<q::Value, QueryExecutionError> {
-        if let Some(q::Value::List(children)) = Self::get_prefetched_child(parent, field) {
-            if children.len() > 1 {
-                let derived_from_field =
-                    sast::get_derived_from_field(object_type, field_definition)
-                        .expect("only derived fields can lead to multiple children here");
-
-                return Err(QueryExecutionError::AmbiguousDerivedFromResult(
-                    field.position.clone(),
-                    field.name.to_owned(),
-                    object_type.name().to_owned(),
-                    derived_from_field.name.to_owned(),
-                ));
-            } else {
-                return Ok(children
-                    .into_iter()
-                    .next()
-                    .map(|value| value.clone())
-                    .unwrap_or(q::Value::Null));
-            }
-        } else {
-            return Err(QueryExecutionError::ResolveEntitiesError(format!(
-                "internal error resolving {}.{} for {:?}: \
-                 expected prefetched result, but found nothing",
-                object_type.name(),
-                &field.name,
-                parent
-            )));
-        }
-    }
-
-    fn locate_block(
-        store: &S,
+    /// locate_block returns the block pointer and it's timestamp when available.
+    async fn locate_block(
+        store: &dyn QueryStore,
         bc: BlockConstraint,
-        subgraph: &SubgraphDeploymentId,
-    ) -> Result<EthereumBlockPointer, QueryExecutionError> {
-        if store
-            .uses_relational_schema(subgraph)
-            .map_err(StoreError::from)?
-            && !subgraph.is_meta()
-        {
-            // Relational storage (most subgraphs); block constraints fully
-            // supported
-            match bc {
-                BlockConstraint::Number(number) => store
-                    .block_ptr(subgraph.clone())
-                    .map_err(|e| StoreError::from(e).into())
-                    .and_then(|ptr| {
-                        let ptr =
-                            ptr.expect("we should have already checked that the subgraph exists");
-                        if ptr.number < number as u64 {
-                            Err(QueryExecutionError::ValueParseError(
-                                "block.number".to_owned(),
-                                format!(
-                                    "subgraph {} has only indexed up to block number {} \
-                                 and data for block number {} is therefore not yet available",
-                                    subgraph, ptr.number, number
-                                ),
-                            ))
-                        } else {
-                            // We don't have a way here to look the block hash up from
-                            // the database, and even if we did, there is no guarantee
-                            // that we have the block in our cache. We therefore
-                            // always return an all zeroes hash when users specify
-                            // a block number
-                            Ok(EthereumBlockPointer::from((
-                                web3::types::H256::zero(),
-                                number as u64,
-                            )))
-                        }
-                    }),
-                BlockConstraint::Hash(hash) => store
-                    .block_number(subgraph, hash)
-                    .map_err(|e| e.into())
-                    .and_then(|number| {
-                        number
+        state: &DeploymentState,
+    ) -> Result<BlockPtrTs, QueryExecutionError> {
+        fn block_queryable(
+            state: &DeploymentState,
+            block: BlockNumber,
+        ) -> Result<(), QueryExecutionError> {
+            state
+                .block_queryable(block)
+                .map_err(|msg| QueryExecutionError::ValueParseError("block.number".to_owned(), msg))
+        }
+
+        async fn get_block_ts(
+            store: &dyn QueryStore,
+            ptr: &BlockPtr,
+        ) -> Result<Option<u64>, QueryExecutionError> {
+            match store
+                .block_number_with_timestamp(&ptr.hash)
+                .await
+                .map_err(Into::<QueryExecutionError>::into)?
+            {
+                Some((_, Some(ts))) => Ok(Some(ts)),
+                _ => Ok(None),
+            }
+        }
+
+        match bc {
+            BlockConstraint::Hash(hash) => {
+                let ptr = store
+                    .block_number_with_timestamp(&hash)
+                    .await
+                    .map_err(Into::into)
+                    .and_then(|result| {
+                        result
                             .ok_or_else(|| {
                                 QueryExecutionError::ValueParseError(
                                     "block.hash".to_owned(),
                                     "no block with that hash found".to_owned(),
                                 )
                             })
-                            .map(|number| EthereumBlockPointer::from((hash, number as u64)))
-                    }),
-                BlockConstraint::Latest => store
-                    .block_ptr(subgraph.clone())
-                    .map_err(|e| StoreError::from(e).into())
-                    .and_then(|ptr| {
-                        let ptr =
-                            ptr.expect("we should have already checked that the subgraph exists");
-                        Ok(ptr)
-                    }),
+                            .map(|(number, ts)| BlockPtrTs {
+                                ptr: BlockPtr::new(hash, number),
+                                timestamp: ts,
+                            })
+                    })?;
+
+                block_queryable(state, ptr.ptr.number)?;
+                Ok(ptr)
             }
-        } else {
-            // JSONB storage or subgraph metadata; only allow BlockConstraint::Latest
-            if matches!(bc, BlockConstraint::Latest) {
-                Ok(EthereumBlockPointer::from((
-                    web3::types::H256::zero(),
-                    BLOCK_NUMBER_MAX as u64,
-                )))
-            } else {
-                Err(QueryExecutionError::NotSupported(
-                    "This subgraph uses JSONB storage, which does not \
-            support querying at a specific block height. Redeploy \
-            a new version of this subgraph to enable this feature."
-                        .to_owned(),
-                ))
+            BlockConstraint::Number(number) => {
+                block_queryable(state, number)?;
+                // We don't have a way here to look the block hash up from
+                // the database, and even if we did, there is no guarantee
+                // that we have the block in our cache. We therefore
+                // always return an all zeroes hash when users specify
+                // a block number
+                // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
+                Ok(BlockPtr::from((web3::types::H256::zero(), number as u64)).into())
+            }
+            BlockConstraint::Min(min) => {
+                let ptr = state.latest_block.cheap_clone();
+                if ptr.number < min {
+                    return Err(QueryExecutionError::ValueParseError(
+                        "block.number_gte".to_owned(),
+                        format!(
+                            "subgraph {} has only indexed up to block number {} \
+                                and data for block number {} is therefore not yet available",
+                            state.id, ptr.number, min
+                        ),
+                    ));
+                }
+                let timestamp = get_block_ts(store, &state.latest_block).await?;
+
+                Ok(BlockPtrTs { ptr, timestamp })
+            }
+            BlockConstraint::Latest => {
+                let timestamp = get_block_ts(store, &state.latest_block).await?;
+
+                Ok(BlockPtrTs {
+                    ptr: state.latest_block.cheap_clone(),
+                    timestamp,
+                })
             }
         }
+    }
+
+    fn handle_meta(
+        &self,
+        prefetched_object: Option<r::Value>,
+        object_type: &ObjectOrInterface<'_>,
+    ) -> Result<(Option<r::Value>, Option<r::Value>), QueryExecutionError> {
+        // Pretend that the whole `_meta` field was loaded by prefetch. Eager
+        // loading this is ok until we add more information to this field
+        // that would force us to query the database; when that happens, we
+        // need to switch to loading on demand
+        if object_type.is_meta() {
+            let hash = self
+                .block_ptr
+                .as_ref()
+                .and_then(|ptr| {
+                    // locate_block indicates that we do not have a block hash
+                    // by setting the hash to `zero`
+                    // See 7a7b9708-adb7-4fc2-acec-88680cb07ec1
+                    let hash_h256 = ptr.ptr.hash_as_h256();
+                    if hash_h256 == web3::types::H256::zero() {
+                        None
+                    } else {
+                        Some(r::Value::String(format!("0x{:x}", hash_h256)))
+                    }
+                })
+                .unwrap_or(r::Value::Null);
+            let number = self
+                .block_ptr
+                .as_ref()
+                .map(|ptr| r::Value::Int(ptr.ptr.number.into()))
+                .unwrap_or(r::Value::Null);
+
+            let timestamp = self.block_ptr.as_ref().map(|ptr| {
+                ptr.timestamp
+                    .map(|ts| r::Value::Int(ts as i64))
+                    .unwrap_or(r::Value::Null)
+            });
+
+            let mut map = BTreeMap::new();
+            let block = object! {
+                hash: hash,
+                number: number,
+                timestamp: timestamp,
+                __typename: BLOCK_FIELD_TYPE
+            };
+            map.insert("prefetch:block".into(), r::Value::List(vec![block]));
+            map.insert(
+                "deployment".into(),
+                r::Value::String(self.deployment.to_string()),
+            );
+            map.insert(
+                "hasIndexingErrors".into(),
+                r::Value::Boolean(self.has_non_fatal_errors),
+            );
+            map.insert(
+                "__typename".into(),
+                r::Value::String(META_FIELD_TYPE.to_string()),
+            );
+            return Ok((None, Some(r::Value::object(map))));
+        }
+        Ok((prefetched_object, None))
     }
 }
 
-impl<S> Resolver for StoreResolver<S>
-where
-    S: Store + SubgraphDeploymentStore,
-{
+#[async_trait]
+impl Resolver for StoreResolver {
+    const CACHEABLE: bool = true;
+
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, QueryExecutionError> {
+        self.store.query_permit().await.map_err(Into::into)
+    }
+
     fn prefetch(
         &self,
         ctx: &ExecutionContext<Self>,
-        selection_set: &q::SelectionSet,
-    ) -> Result<Option<q::Value>, Vec<QueryExecutionError>> {
-        super::prefetch::run(&self, ctx, selection_set).map(|value| Some(value))
+        selection_set: &a::SelectionSet,
+    ) -> Result<(Option<r::Value>, Trace), Vec<QueryExecutionError>> {
+        super::prefetch::run(self, ctx, selection_set, &self.graphql_metrics)
+            .map(|(value, trace)| (Some(value), trace))
     }
 
-    fn resolve_objects(
+    async fn resolve_objects(
         &self,
-        parent: &Option<q::Value>,
-        field: &q::Field,
-        field_definition: &s::Field,
+        prefetched_objects: Option<r::Value>,
+        field: &a::Field,
+        _field_definition: &s::Field,
         object_type: ObjectOrInterface<'_>,
-        arguments: &HashMap<&q::Name, q::Value>,
-        types_for_interface: &BTreeMap<Name, Vec<ObjectType>>,
-        max_first: u32,
-    ) -> Result<q::Value, QueryExecutionError> {
-        if Self::was_prefetched(parent) {
-            return self.resolve_objects_prefetch(parent, field, object_type);
-        }
-
-        let object_type = object_type.into();
-        let mut query = build_query(
-            object_type,
-            self.block,
-            arguments,
-            types_for_interface,
-            max_first,
-        )?;
-
-        // Add matching filter for derived fields
-        let derived_from_field = sast::get_derived_from_field(object_type, field_definition);
-        let is_derived = derived_from_field.is_some();
-        if let Some(derived_from_field) = derived_from_field {
-            Self::add_filter_for_derived_field(&mut query, parent, derived_from_field);
-        }
-
-        // Return an empty list if we're dealing with a non-derived field that
-        // holds an empty list of references; there's no point in querying the store
-        // if the result will be empty anyway
-        if !is_derived
-            && parent.is_some()
-            && Self::references_field_is_empty(parent, &field_definition.name)
-        {
-            return Ok(q::Value::List(vec![]));
-        }
-
-        // Add matching filter for reference fields
-        if !is_derived {
-            Self::add_filter_for_reference_field(&mut query, parent, field_definition, object_type);
-        }
-
-        let mut entity_values = Vec::new();
-        for entity in self.store.find(query)? {
-            entity_values.push(entity.into())
-        }
-        Ok(q::Value::List(entity_values))
-    }
-
-    fn resolve_object(
-        &self,
-        parent: &Option<q::Value>,
-        field: &q::Field,
-        field_definition: &s::Field,
-        object_type: ObjectOrInterface<'_>,
-        arguments: &HashMap<&q::Name, q::Value>,
-        types_for_interface: &BTreeMap<Name, Vec<ObjectType>>,
-    ) -> Result<q::Value, QueryExecutionError> {
-        if Self::was_prefetched(parent) {
-            return self.resolve_object_prefetch(parent, field, field_definition, object_type);
-        }
-
-        let id = arguments.get(&"id".to_string()).and_then(|id| match id {
-            q::Value::String(s) => Some(s),
-            _ => None,
-        });
-
-        // The subgraph_id directive is injected in all types.
-        let subgraph_id = parse_subgraph_id(object_type).unwrap();
-        let subgraph_id_for_resolve_object = subgraph_id.clone();
-
-        let resolve_object_with_id = |id: &String| -> Result<Option<Entity>, QueryExecutionError> {
-            let collection = match object_type {
-                ObjectOrInterface::Object(_) => {
-                    EntityCollection::All(vec![object_type.name().to_owned()])
-                }
-                ObjectOrInterface::Interface(interface) => {
-                    let entity_types = types_for_interface[&interface.name]
-                        .iter()
-                        .map(|o| o.name.clone())
-                        .collect();
-                    EntityCollection::All(entity_types)
-                }
-            };
-            let query = EntityQuery::new(subgraph_id_for_resolve_object, self.block, collection)
-                .filter(EntityFilter::Equal(String::from("id"), Value::from(id)))
-                .first(1);
-            Ok(self.store.find(query)?.into_iter().next())
-        };
-
-        let entity = if let Some(id) = id {
-            resolve_object_with_id(id)?
+    ) -> Result<r::Value, QueryExecutionError> {
+        if let Some(child) = prefetched_objects {
+            Ok(child)
         } else {
-            // Identify whether the field is derived with @derivedFrom
-            let derived_from_field = sast::get_derived_from_field(object_type, field_definition);
-            if let Some(derived_from_field) = derived_from_field {
-                // The field is derived -> build a query for the entity that might be
-                // referencing the parent object
-
-                let mut arguments = arguments.clone();
-
-                // We use first: 2 here to detect and fail if there is more than one
-                // entity that matches the `@derivedFrom`.
-                let first_arg_name = q::Name::from("first");
-                arguments.insert(&first_arg_name, q::Value::Int(q::Number::from(2)));
-
-                let skip_arg_name = q::Name::from("skip");
-                arguments.insert(&skip_arg_name, q::Value::Int(q::Number::from(0)));
-                let mut query =
-                    build_query(object_type, self.block, &arguments, types_for_interface, 2)?;
-                Self::add_filter_for_derived_field(&mut query, parent, derived_from_field);
-
-                // Find the entity or entities that reference the parent entity
-                let entities = self.store.find(query)?;
-
-                if entities.len() > 1 {
-                    return Err(QueryExecutionError::AmbiguousDerivedFromResult(
-                        field.position.clone(),
-                        field.name.to_owned(),
-                        object_type.name().to_owned(),
-                        derived_from_field.name.to_owned(),
-                    ));
-                } else {
-                    entities.into_iter().next()
-                }
-            } else {
-                match parent {
-                    Some(q::Value::Object(parent_object)) => match parent_object.get(&field.name) {
-                        Some(q::Value::String(id)) => resolve_object_with_id(id)?,
-                        _ => None,
-                    },
-                    _ => panic!("top level queries must either take an `id` or return a list"),
-                }
-            }
-        };
-
-        Ok(entity.map_or(q::Value::Null, Into::into))
+            Err(QueryExecutionError::ResolveEntitiesError(format!(
+                "internal error resolving {}.{}: \
+                 expected prefetched result, but found nothing",
+                object_type.name(),
+                &field.name,
+            )))
+        }
     }
 
-    fn resolve_field_stream<'a, 'b>(
+    async fn resolve_object(
         &self,
-        schema: &'a s::Document,
-        object_type: &'a s::ObjectType,
-        field: &'b q::Field,
-    ) -> result::Result<StoreEventStreamBox, QueryExecutionError> {
-        // Fail if the field does not exist on the object type
-        if sast::get_field(object_type, &field.name).is_none() {
-            return Err(QueryExecutionError::UnknownField(
-                field.position,
-                object_type.name.clone(),
-                field.name.clone(),
-            ));
+        prefetched_object: Option<r::Value>,
+        field: &a::Field,
+        field_definition: &s::Field,
+        object_type: ObjectOrInterface<'_>,
+    ) -> Result<r::Value, QueryExecutionError> {
+        let (prefetched_object, meta) = self.handle_meta(prefetched_object, &object_type)?;
+        if let Some(meta) = meta {
+            return Ok(meta);
         }
+        if let Some(r::Value::List(children)) = prefetched_object {
+            if children.len() > 1 {
+                let derived_from_field =
+                    sast::get_derived_from_field(object_type, field_definition)
+                        .expect("only derived fields can lead to multiple children here");
 
+                return Err(QueryExecutionError::AmbiguousDerivedFromResult(
+                    field.position,
+                    field.name.clone(),
+                    object_type.name().to_owned(),
+                    derived_from_field.name.clone(),
+                ));
+            } else {
+                Ok(children.into_iter().next().unwrap_or(r::Value::Null))
+            }
+        } else {
+            return Err(QueryExecutionError::ResolveEntitiesError(format!(
+                "internal error resolving {}.{}: \
+                 expected prefetched result, but found nothing",
+                object_type.name(),
+                &field.name,
+            )));
+        }
+    }
+
+    fn resolve_field_stream(
+        &self,
+        schema: &ApiSchema,
+        object_type: &s::ObjectType,
+        field: &a::Field,
+    ) -> result::Result<UnitStream, QueryExecutionError> {
         // Collect all entities involved in the query field
-        let entities = collect_entities_from_query_field(schema, object_type, field);
+        let object_type = schema.object_type(object_type).into();
+        let entities = collect_entities_from_query_field(schema, object_type, field)?;
 
         // Subscribe to the store and return the entity change stream
-        let deployment_id = parse_subgraph_id(object_type)?;
-        Ok(self.store.subscribe(entities).throttle_while_syncing(
-            &self.logger,
-            self.store.clone(),
-            deployment_id,
-            *SUBSCRIPTION_THROTTLE_INTERVAL,
-        ))
+        Ok(self.subscription_manager.subscribe_no_payload(entities))
+    }
+
+    fn post_process(&self, result: &mut QueryResult) -> Result<(), anyhow::Error> {
+        // Post-processing is only necessary for queries with indexing errors, and no query errors.
+        if !self.has_non_fatal_errors || result.has_errors() {
+            return Ok(());
+        }
+
+        // Add the "indexing_error" to the response.
+        assert!(result.errors_mut().is_empty());
+        *result.errors_mut() = vec![QueryError::IndexingError];
+
+        match self.error_policy {
+            // If indexing errors are denied, we omit results, except for the `_meta` response.
+            // Note that the meta field could have been queried under a different response key,
+            // or a different field queried under the response key `_meta`.
+            ErrorPolicy::Deny => {
+                let data = result.take_data();
+                let meta =
+                    data.and_then(|mut d| d.remove("_meta").map(|m| ("_meta".to_string(), m)));
+                result.set_data(
+                    meta.map(|(key, value)| Object::from_iter(Some((Word::from(key), value)))),
+                );
+            }
+            ErrorPolicy::Allow => (),
+        }
+        Ok(())
     }
 }

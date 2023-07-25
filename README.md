@@ -1,6 +1,6 @@
 # Graph Node
 
-[![Build Status](https://travis-ci.org/graphprotocol/graph-node.svg?branch=master)](https://travis-ci.org/graphprotocol/graph-node)
+[![Build Status](https://github.com/graphprotocol/graph-node/actions/workflows/ci.yml/badge.svg)](https://github.com/graphprotocol/graph-node/actions/workflows/ci.yml?query=branch%3Amaster)
 [![Getting Started Docs](https://img.shields.io/badge/docs-getting--started-brightgreen.svg)](docs/getting-started.md)
 
 [The Graph](https://thegraph.com/) is a protocol for building decentralized applications (dApps) quickly on Ethereum and IPFS using GraphQL.
@@ -16,23 +16,26 @@ For detailed instructions and more context, check out the [Getting Started Guide
 To build and run this project you need to have the following installed on your system:
 
 - Rust (latest stable) – [How to install Rust](https://www.rust-lang.org/en-US/install.html)
+  - Note that `rustfmt`, which is part of the default Rust installation, is a build-time requirement.
 - PostgreSQL – [PostgreSQL Downloads](https://www.postgresql.org/download/)
-- IPFS – [Installing IPFS](https://ipfs.io/docs/install/)
+- IPFS – [Installing IPFS](https://docs.ipfs.io/install/)
+- Profobuf Compiler - [Installing Protobuf](https://grpc.io/docs/protoc-installation/)
 
-For Ethereum network data, you can either run a local node or use Infura.io:
+For Ethereum network data, you can either run your own Ethereum node or use an Ethereum node provider of your choice.
 
-- Local node – [Installing and running Ethereum node](https://ethereum.gitbooks.io/frontier-guide/content/getting_a_client.html)
-- Infura infra – [Infura.io](https://infura.io/)
+**Minimum Hardware Requirements:**
+
+- To build graph-node with `cargo`, 8GB RAM are required.
 
 ### Running a Local Graph Node
 
-This is a quick example to show a working Graph Node. It is a [subgraph for the Ethereum Name Service (ENS)](https://github.com/graphprotocol/ens-subgraph) that The Graph team built.
+This is a quick example to show a working Graph Node. It is a [subgraph for Gravatars](https://github.com/graphprotocol/example-subgraph).
 
 1. Install IPFS and run `ipfs init` followed by `ipfs daemon`.
 2. Install PostgreSQL and run `initdb -D .postgres` followed by `pg_ctl -D .postgres -l logfile start` and `createdb graph-node`.
 3. If using Ubuntu, you may need to install additional packages:
    - `sudo apt-get install -y clang libpq-dev libssl-dev pkg-config`
-4. In the terminal, clone https://github.com/graphprotocol/ens-subgraph, and install dependencies and generate types for contract ABIs:
+4. In the terminal, clone https://github.com/graphprotocol/example-subgraph, and install dependencies and generate types for contract ABIs:
 
 ```
 yarn
@@ -46,17 +49,34 @@ Once you have all the dependencies set up, you can run the following:
 ```
 cargo run -p graph-node --release -- \
   --postgres-url postgresql://USERNAME[:PASSWORD]@localhost:5432/graph-node \
-  --ethereum-rpc mainnet:https://mainnet.infura.io/v3/[PROJECT_ID] \
+  --ethereum-rpc NETWORK_NAME:[CAPABILITIES]:URL \
   --ipfs 127.0.0.1:5001
 ```
 
-Try your OS username as `USERNAME` and `PASSWORD`. The password might be optional. It depends on your setup.
+Try your OS username as `USERNAME` and `PASSWORD`. For details on setting
+the connection string, check the [Postgres
+documentation](https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-CONNSTRING).
+`graph-node` uses a few Postgres extensions. If the Postgres user with which
+you run `graph-node` is a superuser, `graph-node` will enable these
+extensions when it initializes the database. If the Postgres user is not a
+superuser, you will need to create the extensions manually since only
+superusers are allowed to do that. To create them you need to connect as a
+superuser, which in many installations is the `postgres` user:
 
-If you're using Infura you should [sign up](https://infura.io/register) to get a PROJECT_ID, it's free.
+```bash
+    psql -q -X -U <SUPERUSER> graph-node <<EOF
+create extension pg_trgm;
+create extension pg_stat_statements;
+create extension btree_gist;
+create extension postgres_fdw;
+grant usage on foreign data wrapper postgres_fdw to <USERNAME>;
+EOF
+
+```
 
 This will also spin up a GraphiQL interface at `http://127.0.0.1:8000/`.
 
-6.  With this ENS example, to get the subgraph working locally run:
+6.  With this Gravatar example, to get the subgraph working locally run:
 
 ```
 yarn create-local
@@ -90,30 +110,36 @@ OPTIONS:
             Elasticsearch service to write subgraph logs to [env: ELASTICSEARCH_URL=]
 
         --elasticsearch-user <USER>                   User to use for Elasticsearch logging [env: ELASTICSEARCH_USER=]
-        --ethereum-ipc <NETWORK_NAME:FILE>
-            Ethereum network name (e.g. 'mainnet') and Ethereum IPC pipe, separated by a ':'
+        --ethereum-ipc <NETWORK_NAME:[CAPABILITIES]:FILE>
+            Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg full,archive), and an Ethereum IPC pipe, separated by a ':'
 
         --ethereum-polling-interval <MILLISECONDS>
             How often to poll the Ethereum node for new blocks [env: ETHEREUM_POLLING_INTERVAL=]  [default: 500]
 
-        --ethereum-rpc <NETWORK_NAME:URL>
-            Ethereum network name (e.g. 'mainnet') and Ethereum RPC URL, separated by a ':'
+        --ethereum-rpc <NETWORK_NAME:[CAPABILITIES]:URL>
+            Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg 'full,archive'), and an Ethereum RPC URL, separated by a ':'
 
-        --ethereum-ws <NETWORK_NAME:URL>
-            Ethereum network name (e.g. 'mainnet') and Ethereum WebSocket URL, separated by a ':'
+        --ethereum-ws <NETWORK_NAME:[CAPABILITIES]:URL>
+            Ethereum network name (e.g. 'mainnet'), optional comma-seperated capabilities (eg `full,archive), and an Ethereum WebSocket URL, separated by a ':'
+
+        --node-id <NODE_ID>
+            A unique identifier for this node instance. Should have the same value between consecutive node restarts [default: default]
 
         --http-port <PORT>                            Port for the GraphQL HTTP server [default: 8000]
         --ipfs <HOST:PORT>                            HTTP address of an IPFS node
-        --node-id <NODE_ID>                           a unique identifier for this node [default: default]
         --postgres-url <URL>                          Location of the Postgres database used for storing entities
-        --subgraph <[NAME:]IPFS_HASH>                 name and IPFS hash of the subgraph manifest
+        --subgraph <[NAME:]IPFS_HASH>                 Name and IPFS hash of the subgraph manifest
         --ws-port <PORT>                              Port for the GraphQL WebSocket server [default: 8001]
 ```
 
-### Environment Variables
+### Advanced Configuration
 
-See [here](https://github.com/graphprotocol/graph-node/blob/master/docs/environment-variables.md) for a list of
-the environment variables that can be configured.
+The command line arguments generally are all that is needed to run a
+`graph-node` instance. For advanced uses, various aspects of `graph-node`
+can further be configured through [environment
+variables](https://github.com/graphprotocol/graph-node/blob/master/docs/environment-variables.md). Very
+large `graph-node` instances can also split the work of querying and
+indexing across [multiple databases](./docs/config.md).
 
 ## Project Layout
 
@@ -155,6 +181,7 @@ the environment variables that can be configured.
 | Query entity collections | ✅ |
 | Pagination | ✅ |
 | Filtering | ✅ |
+| Block-based Filtering | ✅ |
 | Entity relationships | ✅ |
 | Subscriptions | ✅ |
 

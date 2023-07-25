@@ -1,97 +1,120 @@
-use graphql_parser::query as q;
 use http::StatusCode;
 use hyper::{Body, Client, Request};
-use std::collections::BTreeMap;
 use std::time::Duration;
 
+use graph::data::{
+    graphql::effort::LoadManager,
+    query::{QueryResults, QueryTarget},
+    value::{Object, Word},
+};
 use graph::prelude::*;
 
 use graph_server_http::test_utils;
 use graph_server_http::GraphQLServer as HyperGraphQLServer;
 
-use tokio::time::delay_for;
+use tokio::time::sleep;
+
+pub struct TestGraphQLMetrics;
+
+impl GraphQLMetrics for TestGraphQLMetrics {
+    fn observe_query_execution(&self, _duration: Duration, _results: &QueryResults) {}
+    fn observe_query_parsing(&self, _duration: Duration, _results: &QueryResults) {}
+    fn observe_query_validation(&self, _duration: Duration, _id: &DeploymentHash) {}
+    fn observe_query_validation_error(&self, _error_codes: Vec<&str>, _id: &DeploymentHash) {}
+}
 
 /// A simple stupid query runner for testing.
 pub struct TestGraphQlRunner;
 
+#[async_trait]
 impl GraphQlRunner for TestGraphQlRunner {
-    fn run_query_with_complexity(
-        &self,
+    async fn run_query_with_complexity(
+        self: Arc<Self>,
         _query: Query,
+        _target: QueryTarget,
         _complexity: Option<u64>,
         _max_depth: Option<u8>,
         _max_first: Option<u32>,
-    ) -> QueryResultFuture {
+        _max_skip: Option<u32>,
+    ) -> QueryResults {
         unimplemented!();
     }
 
-    fn run_query(&self, query: Query) -> QueryResultFuture {
-        Box::new(future::ok(QueryResult::new(Some(q::Value::Object(
-            if query.variables.is_some()
-                && query
-                    .variables
-                    .as_ref()
-                    .unwrap()
-                    .get(&String::from("equals"))
-                    .is_some()
-                && query
-                    .variables
-                    .unwrap()
-                    .get(&String::from("equals"))
-                    .unwrap()
-                    == &q::Value::String(String::from("John"))
-            {
-                BTreeMap::from_iter(
-                    vec![(String::from("name"), q::Value::String(String::from("John")))]
-                        .into_iter(),
-                )
-            } else {
-                BTreeMap::from_iter(
-                    vec![(
-                        String::from("name"),
-                        q::Value::String(String::from("Jordi")),
-                    )]
-                    .into_iter(),
-                )
-            },
-        )))))
+    async fn run_query(self: Arc<Self>, query: Query, _target: QueryTarget) -> QueryResults {
+        if query.variables.is_some()
+            && query
+                .variables
+                .as_ref()
+                .unwrap()
+                .get(&String::from("equals"))
+                .is_some()
+            && query
+                .variables
+                .unwrap()
+                .get(&String::from("equals"))
+                .unwrap()
+                == &r::Value::String(String::from("John"))
+        {
+            Object::from_iter(
+                vec![(Word::from("name"), r::Value::String(String::from("John")))].into_iter(),
+            )
+        } else {
+            Object::from_iter(
+                vec![(Word::from("name"), r::Value::String(String::from("Jordi")))].into_iter(),
+            )
+        }
+        .into()
     }
 
-    fn run_subscription(&self, _subscription: Subscription) -> SubscriptionResultFuture {
+    async fn run_subscription(
+        self: Arc<Self>,
+        _subscription: Subscription,
+        _target: QueryTarget,
+    ) -> Result<SubscriptionResult, SubscriptionError> {
         unreachable!();
+    }
+
+    fn load_manager(&self) -> Arc<LoadManager> {
+        unimplemented!()
+    }
+
+    fn metrics(&self) -> Arc<dyn GraphQLMetrics> {
+        Arc::new(TestGraphQLMetrics)
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use graph_mock::{mock_store_with_users_subgraph, MockMetricsRegistry};
+
+    lazy_static! {
+        static ref USERS: DeploymentHash = DeploymentHash::new("users").unwrap();
+    }
 
     #[test]
     fn rejects_empty_json() {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime
             .block_on(async {
                 let logger = Logger::root(slog::Discard, o!());
-                let logger_factory = LoggerFactory::new(logger, None);
-                let metrics_registry = Arc::new(MockMetricsRegistry::new());
-                let (store, id) = mock_store_with_users_subgraph();
+                let logger_factory = LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
+                let id = USERS.clone();
                 let query_runner = Arc::new(TestGraphQlRunner);
                 let node_id = NodeId::new("test").unwrap();
-                let mut server = HyperGraphQLServer::new(&logger_factory, metrics_registry, query_runner, store, node_id);
+                let mut server = HyperGraphQLServer::new(&logger_factory, query_runner, node_id);
                 let http_server = server
-                    .serve(8001, 8002)
+                    .serve(8007, 8008)
                     .expect("Failed to start GraphQL server");
 
                 // Launch the server to handle a single request
                 tokio::spawn(http_server.fuse().compat());
                 // Give some time for the server to start.
-                delay_for(Duration::from_secs(2))
+                sleep(Duration::from_secs(2))
                     .then(move |()| {
                         // Send an empty JSON POST request
                         let client = Client::new();
                         let request =
-                            Request::post(format!("http://localhost:8001/subgraphs/id/{}", id))
+                            Request::post(format!("http://localhost:8007/subgraphs/id/{}", id))
                                 .body(Body::from("{}"))
                                 .unwrap();
 
@@ -100,37 +123,27 @@ mod test {
                     })
                     .map_ok(|response| {
                         let errors =
-                            test_utils::assert_error_response(response, StatusCode::BAD_REQUEST);
+                            test_utils::assert_error_response(response, StatusCode::BAD_REQUEST, false);
 
                         let message = errors[0]
-                            .as_object()
-                            .expect("Query error is not an object")
-                            .get("message")
-                            .expect("Error contains no message")
                             .as_str()
                             .expect("Error message is not a string");
-                        assert_eq!(message, "GraphQL server error (client error): The \"query\" field missing in request data");
+                        assert_eq!(message, "GraphQL server error (client error): The \"query\" field is missing in request data");
                     }).await.unwrap()
             })
     }
 
     #[test]
     fn rejects_invalid_queries() {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
-            let logger_factory = LoggerFactory::new(logger, None);
-            let metrics_registry = Arc::new(MockMetricsRegistry::new());
-            let (store, id) = mock_store_with_users_subgraph();
+            let logger_factory =
+                LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
+            let id = USERS.clone();
             let query_runner = Arc::new(TestGraphQlRunner);
             let node_id = NodeId::new("test").unwrap();
-            let mut server = HyperGraphQLServer::new(
-                &logger_factory,
-                metrics_registry,
-                query_runner,
-                store,
-                node_id,
-            );
+            let mut server = HyperGraphQLServer::new(&logger_factory, query_runner, node_id);
             let http_server = server
                 .serve(8002, 8003)
                 .expect("Failed to start GraphQL server");
@@ -138,7 +151,7 @@ mod test {
             // Launch the server to handle a single request
             tokio::spawn(http_server.fuse().compat());
             // Give some time for the server to start.
-            delay_for(Duration::from_secs(2))
+            sleep(Duration::from_secs(2))
                 .then(move |()| {
                     // Send an broken query request
                     let client = Client::new();
@@ -151,8 +164,7 @@ mod test {
                     client.request(request)
                 })
                 .map_ok(|response| {
-                    let errors =
-                        test_utils::assert_error_response(response, StatusCode::BAD_REQUEST);
+                    let errors = test_utils::assert_error_response(response, StatusCode::OK, true);
 
                     let message = errors[0]
                         .as_object()
@@ -204,21 +216,15 @@ mod test {
 
     #[test]
     fn accepts_valid_queries() {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
-            let logger_factory = LoggerFactory::new(logger, None);
-            let metrics_registry = Arc::new(MockMetricsRegistry::new());
-            let (store, id) = mock_store_with_users_subgraph();
+            let logger_factory =
+                LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
+            let id = USERS.clone();
             let query_runner = Arc::new(TestGraphQlRunner);
             let node_id = NodeId::new("test").unwrap();
-            let mut server = HyperGraphQLServer::new(
-                &logger_factory,
-                metrics_registry,
-                query_runner,
-                store,
-                node_id,
-            );
+            let mut server = HyperGraphQLServer::new(&logger_factory, query_runner, node_id);
             let http_server = server
                 .serve(8003, 8004)
                 .expect("Failed to start GraphQL server");
@@ -226,7 +232,7 @@ mod test {
             // Launch the server to handle a single request
             tokio::spawn(http_server.fuse().compat());
             // Give some time for the server to start.
-            delay_for(Duration::from_secs(2))
+            sleep(Duration::from_secs(2))
                 .then(move |()| {
                     // Send a valid example query
                     let client = Client::new();
@@ -256,21 +262,15 @@ mod test {
 
     #[test]
     fn accepts_valid_queries_with_variables() {
-        let mut runtime = tokio::runtime::Runtime::new().unwrap();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
         let _ = runtime.block_on(async {
             let logger = Logger::root(slog::Discard, o!());
-            let logger_factory = LoggerFactory::new(logger, None);
-            let metrics_registry = Arc::new(MockMetricsRegistry::new());
-            let (store, id) = mock_store_with_users_subgraph();
+            let logger_factory =
+                LoggerFactory::new(logger, None, Arc::new(MetricsRegistry::mock()));
+            let id = USERS.clone();
             let query_runner = Arc::new(TestGraphQlRunner);
             let node_id = NodeId::new("test").unwrap();
-            let mut server = HyperGraphQLServer::new(
-                &logger_factory,
-                metrics_registry,
-                query_runner,
-                store,
-                node_id,
-            );
+            let mut server = HyperGraphQLServer::new(&logger_factory, query_runner, node_id);
             let http_server = server
                 .serve(8005, 8006)
                 .expect("Failed to start GraphQL server");
@@ -278,7 +278,7 @@ mod test {
             // Launch the server to handle a single request
             tokio::spawn(http_server.fuse().compat());
             // Give some time for the server to start.
-            delay_for(Duration::from_secs(2))
+            sleep(Duration::from_secs(2))
                 .then(move |()| {
                     // Send a valid example query
                     let client = Client::new();

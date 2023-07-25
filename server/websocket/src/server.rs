@@ -1,5 +1,8 @@
-use graph::data::subgraph::schema::SUBGRAPHS_ID;
-use graph::prelude::{SubscriptionServer as SubscriptionServerTrait, *};
+use graph::{
+    data::query::QueryTarget,
+    prelude::{SubscriptionServer as SubscriptionServerTrait, *},
+};
+use http::header::{ACCESS_CONTROL_ALLOW_ORIGIN, CONTENT_TYPE};
 use http::{HeaderValue, Response, StatusCode};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Mutex;
@@ -19,7 +22,7 @@ pub struct SubscriptionServer<Q, S> {
 impl<Q, S> SubscriptionServer<Q, S>
 where
     Q: GraphQlRunner,
-    S: SubgraphDeploymentStore + Store,
+    S: QueryStoreManager,
 {
     pub fn new(logger: &Logger, graphql_runner: Arc<Q>, store: Arc<S>) -> Self {
         SubscriptionServer {
@@ -29,12 +32,38 @@ where
         }
     }
 
-    fn subgraph_id_from_url_path(
+    async fn subgraph_id_from_url_path(
         store: Arc<S>,
         path: &str,
-    ) -> Result<Option<SubgraphDeploymentId>, Error> {
+    ) -> Result<Option<DeploymentState>, Error> {
+        fn target_from_name(name: String, api_version: ApiVersion) -> Option<QueryTarget> {
+            SubgraphName::new(name)
+                .ok()
+                .map(|sub_name| QueryTarget::Name(sub_name, api_version))
+        }
+
+        fn target_from_id(id: &str, api_version: ApiVersion) -> Option<QueryTarget> {
+            DeploymentHash::new(id)
+                .ok()
+                .map(|hash| QueryTarget::Deployment(hash, api_version))
+        }
+
+        async fn state<S: QueryStoreManager>(
+            store: Arc<S>,
+            target: Option<QueryTarget>,
+        ) -> Option<DeploymentState> {
+            let target = match target {
+                Some(target) => target,
+                None => return None,
+            };
+            match store.query_store(target, false).await.ok() {
+                Some(query_store) => query_store.deployment_state().await.ok(),
+                None => None,
+            }
+        }
+
         let path_segments = {
-            let mut segments = path.split("/");
+            let mut segments = path.split('/');
 
             // Remove leading '/'
             let first_segment = segments.next();
@@ -46,24 +75,19 @@ where
         };
 
         match path_segments.as_slice() {
-            &["subgraphs"] => Ok(Some(SUBGRAPHS_ID.clone())),
-            &["subgraphs", "id", subgraph_id] => Ok(SubgraphDeploymentId::new(subgraph_id).ok()),
-            &["subgraphs", "name", _] | &["subgraphs", "name", _, _] => {
-                let subgraph_name = path_segments[2..].join("/");
-
-                match SubgraphName::new(subgraph_name) {
-                    Err(()) => Ok(None),
-                    Ok(subgraph_name) => store.resolve_subgraph_name_to_id(subgraph_name),
-                }
+            &["subgraphs", "id", subgraph_id] => {
+                Ok(state(store, target_from_id(subgraph_id, ApiVersion::default())).await)
             }
-            &["subgraphs", "network", _, _] => {
-                let subgraph_name = path_segments[1..].join("/");
-
-                match SubgraphName::new(subgraph_name) {
-                    Err(()) => Ok(None),
-                    Ok(subgraph_name) => store.resolve_subgraph_name_to_id(subgraph_name),
-                }
-            }
+            &["subgraphs", "name", _] | &["subgraphs", "name", _, _] => Ok(state(
+                store,
+                target_from_name(path_segments[2..].join("/"), ApiVersion::default()), // TODO: version
+            )
+            .await),
+            &["subgraphs", "network", _, _] => Ok(state(
+                store,
+                target_from_name(path_segments[1..].join("/"), ApiVersion::default()), // TODO: version
+            )
+            .await),
             _ => Ok(None),
         }
     }
@@ -73,7 +97,7 @@ where
 impl<Q, S> SubscriptionServerTrait for SubscriptionServer<Q, S>
 where
     Q: GraphQlRunner,
-    S: SubgraphDeploymentStore + Store,
+    S: QueryStoreManager,
 {
     async fn serve(self, port: u16) {
         info!(
@@ -82,14 +106,13 @@ where
         );
 
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port);
-        let mut socket = TcpListener::bind(&addr)
+        let socket = TcpListener::bind(&addr)
             .await
             .expect("Failed to bind WebSocket port");
 
-        let mut incoming = socket.incoming();
-        while let Some(stream_res) = incoming.next().await {
-            let stream = match stream_res {
-                Ok(stream) => stream,
+        loop {
+            let stream = match socket.accept().await {
+                Ok((stream, _)) => stream,
                 Err(e) => {
                     trace!(self.logger, "Connection error: {}", e);
                     continue;
@@ -99,7 +122,6 @@ where
             let logger2 = self.logger.clone();
             let graphql_runner = self.graphql_runner.clone();
             let store = self.store.clone();
-            let store2 = self.store.clone();
 
             // Subgraph that the request is resolved to (if any)
             let subgraph_id = Arc::new(Mutex::new(None));
@@ -109,34 +131,59 @@ where
                 // Try to obtain the subgraph ID or name from the URL path.
                 // Return a 404 if the URL path contains no name/ID segment.
                 let path = request.uri().path();
-                let subgraph_id = Self::subgraph_id_from_url_path(store.clone(), path.as_ref())
-                    .map_err(|e| {
-                        error!(
-                            logger,
-                            "Error resolving subgraph ID from URL path";
-                            "error" => e.to_string()
-                        );
 
-                        Response::builder().status(StatusCode::INTERNAL_SERVER_ERROR).body(None).unwrap()
-                    }).and_then(|subgraph_id_opt| {
-                        subgraph_id_opt.ok_or_else(|| {
-                            Response::builder().status(StatusCode::NOT_FOUND).body(None).unwrap()
-                        })
-                    })?;
+                // `block_in_place` is not recommended but in this case we have no alternative since
+                // we're in an async context but `tokio_tungstenite` doesn't allow this callback
+                // to be a future.
+                let state = tokio::task::block_in_place(|| {
+                    graph::block_on(Self::subgraph_id_from_url_path(
+                        store.clone(),
+                        path,
+                    ))
+                })
+                .map_err(|e| {
+                    error!(
+                        logger,
+                        "Error resolving subgraph ID from URL path";
+                        "error" => e.to_string()
+                    );
+
+                    Response::builder()
+                        .status(StatusCode::INTERNAL_SERVER_ERROR)
+                        .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                        .header(CONTENT_TYPE, "text/plain")
+                        .body(None)
+                        .unwrap()
+                })
+                .and_then(|state| {
+                    state.ok_or_else(|| {
+                        Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .header(CONTENT_TYPE, "text/plain")
+                            .body(None)
+                            .unwrap()
+                    })
+                })?;
 
                 // Check if the subgraph is deployed
-                match store.is_deployed(&subgraph_id) {
-                    Err(_) | Ok(false) => {
+                if !state.is_deployed() {
                         error!(logger, "Failed to establish WS connection, no data found for subgraph";
-                                        "subgraph_id" => subgraph_id.to_string(),
+                                        "subgraph_id" => state.id.to_string(),
                         );
-                        return Err(Response::builder().status(StatusCode::NOT_FOUND).body(None).unwrap());
+                        return Err(Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header(ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+                            .header(CONTENT_TYPE, "text/plain")
+                            .body(None)
+                            .unwrap());
                     }
-                    Ok(true) => (),
-                }
 
-                *accept_subgraph_id.lock().unwrap() = Some(subgraph_id);
-                response.headers_mut().insert("Sec-WebSocket-Protocol", HeaderValue::from_static("graphql-ws"));
+                *accept_subgraph_id.lock().unwrap() = Some(state.id);
+                response.headers_mut().insert(
+                    "Sec-WebSocket-Protocol",
+                    HeaderValue::from_static("graphql-ws"),
+                );
                 Ok(response)
             })
             .then(move |result| async move {
@@ -145,22 +192,10 @@ where
                         // Obtain the subgraph ID or name that we resolved the request to
                         let subgraph_id = subgraph_id.lock().unwrap().clone().unwrap();
 
-                        // Get the subgraph schema
-                        let schema = match store2.api_schema(&subgraph_id) {
-                            Ok(schema) => schema,
-                            Err(e) => {
-                                error!(logger2, "Failed to establish WS connection, could not find schema";
-                                                "subgraph" => subgraph_id.to_string(),
-                                                "error" => e.to_string(),
-                                );
-                                return;
-                            }
-                        };
-
                         // Spawn a GraphQL over WebSocket connection
                         let service = GraphQlConnection::new(
                             &logger2,
-                            schema,
+                            subgraph_id,
                             ws_stream,
                             graphql_runner.clone(),
                         );

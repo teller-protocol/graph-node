@@ -1,4 +1,15 @@
-use futures03::executor::block_on;
+//! The functions in this module should be used to execute futures, serving as a facade to the
+//! underlying executor implementation which currently is tokio. This serves a few purposes:
+//! - Avoid depending directly on tokio APIs, making upgrades or a potential switch easier.
+//! - Reflect our chosen default semantics of aborting on task panic, offering `*_allow_panic`
+//!   functions to opt out of that.
+//! - Reflect that historically we've used blocking futures due to making DB calls directly within
+//!   futures. This point should go away once https://github.com/graphprotocol/graph-node/issues/905
+//!   is resolved. Then the blocking flavors should no longer accept futures but closures.
+//!
+//! These should not be called from within executors other than tokio, particularly the blocking
+//! functions will panic in that case. We should generally avoid mixing executors whenever possible.
+
 use futures03::future::{FutureExt, TryFutureExt};
 use std::future::Future as Future03;
 use std::panic::AssertUnwindSafe;
@@ -32,44 +43,28 @@ pub fn spawn_blocking<T: Send + 'static>(
     tokio::task::spawn_blocking(move || block_on(abort_on_panic(f)))
 }
 
-/// Panics result in an `Err` in `JoinHandle`.
-pub fn spawn_blocking_allow_panic<T: Send + 'static>(
-    f: impl Future03<Output = T> + Send + 'static,
-) -> JoinHandle<T> {
-    tokio::task::spawn_blocking(move || block_on(f))
-}
-
-/// Does not abort on panic
-pub async fn spawn_blocking_async_allow_panic<R: 'static + Send>(
+/// Does not abort on panic, panics result in an `Err` in `JoinHandle`.
+pub fn spawn_blocking_allow_panic<R: 'static + Send>(
     f: impl 'static + FnOnce() -> R + Send,
-) -> R {
-    tokio::task::spawn_blocking(f).await.unwrap()
+) -> JoinHandle<R> {
+    tokio::task::spawn_blocking(f)
 }
 
-/// Panics if there is no current tokio::Runtime
-pub fn block_on_allow_panic<T>(f: impl Future03<Output = T> + Send) -> T {
-    let rt = tokio::runtime::Handle::current();
+/// Runs the future on the current thread. Panics if not within a tokio runtime.
+pub fn block_on<T>(f: impl Future03<Output = T>) -> T {
+    tokio::runtime::Handle::current().block_on(f)
+}
 
-    rt.enter(move || {
-        // TODO: It should be possible to just call block_on directly, but we
-        // ran into this bug https://github.com/rust-lang/futures-rs/issues/2090
-        // which will panic if we're already in block_on. So, detect if this
-        // function would panic. Once we fix this, we can remove the requirement
-        // of + Send for f (and few functions that call this that had +Send
-        // added) The test which ran into this bug was
-        // runtime::wasm::test::ipfs_fail
-        let enter = futures03::executor::enter();
-        let oh_no = enter.is_err();
-        drop(enter);
-
-        // If the function would panic, fallback to the old ways.
-        if oh_no {
-            use futures::future::Future as _;
-            let compat = async { Result::<T, ()>::Ok(f.await) }.boxed().compat();
-            // This unwrap does not panic because of the above line always returning Ok
-            compat.wait().unwrap()
-        } else {
-            block_on(f)
-        }
+/// Spawns a thread with access to the tokio runtime. Panics if the thread cannot be spawned.
+pub fn spawn_thread(
+    name: impl Into<String>,
+    f: impl 'static + FnOnce() + Send,
+) -> std::thread::JoinHandle<()> {
+    let conf = std::thread::Builder::new().name(name.into());
+    let runtime = tokio::runtime::Handle::current();
+    conf.spawn(move || {
+        let _runtime_guard = runtime.enter();
+        f()
     })
+    .unwrap()
 }

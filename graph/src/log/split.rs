@@ -32,10 +32,7 @@ where
 {
     /// Creates a new split drain that forwards to the two provided drains.
     fn new(drain1: D1, drain2: D2) -> Self {
-        SplitDrain {
-            drain1: drain1,
-            drain2: drain2,
-        }
+        SplitDrain { drain1, drain2 }
     }
 }
 
@@ -70,7 +67,7 @@ where
 {
     let split_drain = SplitDrain::new(drain1.fuse(), drain2.fuse()).fuse();
     let async_drain = slog_async::Async::new(split_drain)
-        .chan_size(10000)
+        .chan_size(20000)
         .build()
         .fuse();
     Logger::root(async_drain, o!())

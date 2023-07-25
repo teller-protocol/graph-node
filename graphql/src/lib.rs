@@ -1,10 +1,5 @@
 pub extern crate graphql_parser;
 
-use graph::prelude::failure;
-
-/// Utilities for working with GraphQL schemas.
-pub mod schema;
-
 /// Utilities for schema introspection.
 pub mod introspection;
 
@@ -26,18 +21,25 @@ mod store;
 /// The external interface for actually running queries
 mod runner;
 
+/// Utilities for working with Prometheus.
+mod metrics;
+
 /// Prelude that exports the most important traits and types.
 pub mod prelude {
-    pub use super::execution::{ExecutionContext, ObjectOrInterface, Query, Resolver};
-    pub use super::introspection::{introspection_schema, IntrospectionResolver};
+    pub use super::execution::{ast as a, ExecutionContext, Query, Resolver};
+    pub use super::introspection::IntrospectionResolver;
     pub use super::query::{execute_query, ext::BlockConstraint, QueryExecutionOptions};
-    pub use super::schema::{api_schema, ast::validate_entity, APISchemaError};
-    pub use super::store::{build_query, StoreResolver};
-    pub use super::subscription::{execute_subscription, SubscriptionExecutionOptions};
-    pub use super::values::{object_value, IntoValue, MaybeCoercible};
+    pub use super::store::StoreResolver;
+    pub use super::subscription::SubscriptionExecutionOptions;
+    pub use super::values::MaybeCoercible;
 
-    pub use super::graphql_parser::{query::Name, schema::ObjectType};
+    pub use super::metrics::GraphQLMetrics;
     pub use super::runner::GraphQlRunner;
+    pub use graph::prelude::s::ObjectType;
+}
 
-    pub use crate::object;
+#[cfg(debug_assertions)]
+pub mod test_support {
+    pub use super::metrics::GraphQLMetrics;
+    pub use super::runner::INITIAL_DEPLOYMENT_STATE_FOR_TESTS;
 }

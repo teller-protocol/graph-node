@@ -1,10 +1,9 @@
 [package]
 name = "graph-server-json-rpc"
-version = "0.18.0"
-edition = "2018"
+version.workspace = true
+edition.workspace = true
 
 [dependencies]
 graph = { path = "../../graph" }
-jsonrpc-http-server = "14.0.6"
-lazy_static = "1.2.0"
+jsonrpsee = { version = "0.15.1", features = ["http-server"] }
 serde = "1.0"
